@@ -7,16 +7,19 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"regexp"
-	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mustiko/auto-tunnel/internal/discovery"
 	"github.com/mustiko/auto-tunnel/internal/sshconn"
+	"github.com/mustiko/auto-tunnel/internal/state"
+	"github.com/mustiko/auto-tunnel/internal/tunnel"
 )
 
 type config struct {
@@ -24,6 +27,8 @@ type config struct {
 	logPath            string
 	dialTimeout        time.Duration
 	interval           time.Duration
+	bind               string
+	fallbackBase       int
 	psCommand          string
 	inspectCommand     string
 	include            *regexp.Regexp
@@ -85,8 +90,8 @@ func run() error {
 	return watchErr
 }
 
-// watch polls the remote Docker daemon and reports what changed. Milestone 2
-// stops here; the tunnel manager and TUI consume the same stream later.
+// watch polls the remote Docker daemon, keeps the tunnel set in sync with what
+// it finds, and prints the table whenever it changes.
 func watch(ctx context.Context, cfg *config, conn *sshconn.Conn, logger *slog.Logger) error {
 	disc := discovery.New(discovery.Options{
 		PSCommand:          cfg.psCommand,
@@ -96,17 +101,19 @@ func watch(ctx context.Context, cfg *config, conn *sshconn.Conn, logger *slog.Lo
 		IncludeUnpublished: cfg.includeUnpublished,
 		Log:                logger,
 	})
+	alloc := tunnel.NewAllocator(cfg.bind, cfg.fallbackBase, tunnel.DefaultFallbackSize)
+	manager := tunnel.NewManager(tunnel.SSHDialer(conn), alloc, logger)
+	defer manager.Close()
 
 	ticker := time.NewTicker(cfg.interval)
 	defer ticker.Stop()
 
-	var previous string
-	var lastErr string
+	var previous, lastErr string
 	for {
 		client := conn.Client()
 		if client == nil {
 			if lastErr != "ssh-down" {
-				fmt.Println("auto-tunnel: ssh connection down, waiting to reconnect")
+				fmt.Println("auto-tunnel: ssh connection down, local ports stay bound while it reconnects")
 				lastErr = "ssh-down"
 			}
 		} else {
@@ -123,11 +130,13 @@ func watch(ctx context.Context, cfg *config, conn *sshconn.Conn, logger *slog.Lo
 				for _, w := range result.Warnings {
 					logger.Warn("discovery warning", "detail", w)
 				}
-				if summary := render(result); summary != previous {
-					fmt.Print(summary)
-					previous = summary
-				}
+				manager.Reconcile(ctx, result.Maps)
 			}
+		}
+
+		if summary := render(cfg, manager.Tunnels()); summary != previous {
+			fmt.Print(summary)
+			previous = summary
 		}
 
 		select {
@@ -139,34 +148,30 @@ func watch(ctx context.Context, cfg *config, conn *sshconn.Conn, logger *slog.Lo
 	}
 }
 
-// render formats a poll result. Its output doubles as a change key: identical
-// text means nothing worth reporting moved.
-func render(r *discovery.Result) string {
+// render formats the tunnel table. Its output doubles as a change key: identical
+// text means nothing worth reporting moved. Byte counters are deliberately left
+// out so idle traffic does not redraw the table on every poll.
+func render(cfg *config, tunnels []state.Tunnel) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n%d container(s), %d forwardable port(s)\n", r.Containers, countForwardable(r.Maps))
-	maps := append([]discovery.PortMap(nil), r.Maps...)
-	sort.Slice(maps, func(i, j int) bool { return maps[i].Key() < maps[j].Key() })
-	for _, pm := range maps {
+	fmt.Fprintf(&b, "\n%d tunnel(s)\n", len(tunnels))
+	for _, t := range tunnels {
+		local := "-"
+		if t.LocalPort != 0 {
+			local = net.JoinHostPort(cfg.bind, strconv.Itoa(t.LocalPort))
+		}
 		note := ""
-		if !pm.Forwardable() {
-			note = fmt.Sprintf("  (%s not forwardable over ssh)", strings.ToUpper(string(pm.Proto)))
-		} else if !pm.Published() {
+		switch {
+		case t.State == state.TunnelUnsupported:
+			note = fmt.Sprintf("  (%s is not forwardable over ssh)", strings.ToUpper(t.Proto))
+		case t.State == state.TunnelError:
+			note = "  (" + t.LastError + ")"
+		case !t.Published:
 			note = "  (unpublished, via container IP)"
 		}
-		fmt.Fprintf(&b, "  %-24s %-28s remote %s -> container port %d%s\n",
-			truncate(pm.Name, 24), truncate(pm.Image, 28), pm.Target(), pm.ContainerPort, note)
+		fmt.Fprintf(&b, "  %-11s %-24s %-22s -> %s%s\n",
+			t.State, truncate(t.Name, 24), local, t.RemoteTarget, note)
 	}
 	return b.String()
-}
-
-func countForwardable(maps []discovery.PortMap) int {
-	n := 0
-	for _, pm := range maps {
-		if pm.Forwardable() {
-			n++
-		}
-	}
-	return n
 }
 
 func truncate(s string, n int) string {
@@ -187,6 +192,8 @@ func parseFlags() (*config, error) {
 	fs.StringVar(&cfg.logPath, "log", "auto-tunnel.log", "log file path (\"-\" writes to stderr)")
 	fs.DurationVar(&cfg.dialTimeout, "connect-timeout", sshconn.DefaultDialTimeout, "SSH connect timeout")
 	fs.DurationVar(&cfg.interval, "interval", 5*time.Second, "how often to poll the remote docker daemon")
+	fs.StringVar(&cfg.bind, "bind", "127.0.0.1", "local address to bind forwarded ports on")
+	fs.IntVar(&cfg.fallbackBase, "fallback-base", tunnel.DefaultFallbackBase, "first port tried when the preferred local port is taken")
 	fs.StringVar(&cfg.psCommand, "docker-cmd", discovery.DefaultPSCommand, "remote command listing containers as JSON")
 	fs.StringVar(&cfg.inspectCommand, "docker-inspect-cmd", discovery.DefaultInspectCommand, "remote command prefix used to resolve container IPs")
 	fs.StringVar(&includePattern, "include", "", "only forward containers whose name matches this regexp")
