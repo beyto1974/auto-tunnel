@@ -1,0 +1,8 @@
+# build output
+/auto-tunnel
+
+# runtime logs
+*.log
+
+# tooling
+.tokensave/
