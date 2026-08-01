@@ -24,24 +24,63 @@ ACTIVE       web                    nginx:alpine      8080         127.0.0.1:808
 Linux and macOS, amd64 and arm64. Windows is not supported: auto-tunnel finds your key through
 `SSH_AUTH_SOCK`, which Windows OpenSSH does not set — it exposes the agent as a named pipe instead.
 
-**Prebuilt binary.** Every `v*` tag publishes archives and a `checksums.txt` to the
-[releases page](https://github.com/beyto1974/auto-tunnel/releases). The repository is private, so
-downloads are authenticated — run `gh auth login` first.
+### Prebuilt binary
+
+Every `v*` tag publishes archives and a `checksums.txt` to the
+[releases page](https://github.com/beyto1974/auto-tunnel/releases). No Go toolchain needed; the binaries
+are statically linked and depend on nothing.
+
+The repository is private, so downloads are authenticated. Run `gh auth login` once, then:
 
 ```sh
 gh release download --repo beyto1974/auto-tunnel --pattern '*linux_amd64*'
-tar -xzf auto-tunnel_*_linux_amd64.tar.gz
+tar -xzf auto-tunnel_linux_amd64.tar.gz
 install -m755 auto-tunnel ~/.local/bin/
 ```
 
-**With the Go toolchain.** `GOPRIVATE` keeps the module proxy out of the loop, which it has to be for a
-private repository:
+Substitute `linux_arm64`, `darwin_amd64`, or `darwin_arm64` as needed, or drop `--pattern` to fetch every
+archive plus `checksums.txt`.
+
+<details>
+<summary>curl, if the repository is ever made public</summary>
+
+Archive names carry no version, so `latest/download` always resolves to the newest release:
+
+```sh
+curl -fsSL https://github.com/beyto1974/auto-tunnel/releases/latest/download/auto-tunnel_linux_amd64.tar.gz \
+  | tar -xz -C ~/.local/bin auto-tunnel
+```
+
+Detecting the platform instead of hardcoding it:
+
+```sh
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m); [ "$arch" = x86_64 ] && arch=amd64; [ "$arch" = aarch64 ] && arch=arm64
+curl -fsSL "https://github.com/beyto1974/auto-tunnel/releases/latest/download/auto-tunnel_${os}_${arch}.tar.gz" \
+  | tar -xz -C ~/.local/bin auto-tunnel
+```
+
+This will **not** work while the repository is private: GitHub serves private release assets only from
+the API, and only to a request carrying a token *and* `Accept: application/octet-stream`, which means
+resolving the asset id first. `gh release download` does all of that for you, so prefer it.
+</details>
+
+Verify a download against the published checksums:
+
+```sh
+gh release download --repo beyto1974/auto-tunnel --pattern 'checksums.txt'
+sha256sum -c checksums.txt --ignore-missing
+```
+
+### With the Go toolchain
+
+`GOPRIVATE` keeps the module proxy out of the loop, which it has to be for a private repository:
 
 ```sh
 GOPRIVATE=github.com/beyto1974/* go install github.com/beyto1974/auto-tunnel@latest
 ```
 
-**From source.**
+### From source
 
 ```sh
 go build -o auto-tunnel .

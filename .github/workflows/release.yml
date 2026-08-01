@@ -46,7 +46,10 @@ jobs:
               -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" \
               -o build/auto-tunnel .
-            tar -czf "dist/auto-tunnel_${VERSION}_${goos}_${goarch}.tar.gz" \
+            # The version is deliberately left out of the archive name so
+            # /releases/latest/download/<name> resolves, which is what makes a
+            # one-line curl install possible. The binary knows its own version.
+            tar -czf "dist/auto-tunnel_${goos}_${goarch}.tar.gz" \
               -C build auto-tunnel \
               -C "$GITHUB_WORKSPACE" README.md
           done
