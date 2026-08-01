@@ -155,7 +155,7 @@ func runPlain(ctx context.Context, cfg *config, eng *engine) error {
 	for {
 		snap := eng.snapshot()
 		if summary := render(cfg, snap); summary != previous {
-			fmt.Print(summary)
+			fmt.Printf("\n[%s] %s", time.Now().Format("15:04:05"), summary)
 			previous = summary
 		}
 
@@ -168,13 +168,13 @@ func runPlain(ctx context.Context, cfg *config, eng *engine) error {
 	}
 }
 
-// render formats the tunnel table. Its output doubles as a change key: identical
-// text means nothing worth reporting moved. Byte counters are deliberately left
-// out so ordinary traffic does not redraw the table on every refresh.
+// render formats the tunnel table. Its output doubles as a change key, so it
+// must contain nothing that changes on its own: no timestamp (the caller adds
+// one) and no byte counters, or the table would reprint on every refresh.
 func render(cfg *config, snap state.Snapshot) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n[%s] ssh %s · %d container(s) · %d tunnel(s)\n",
-		time.Now().Format("15:04:05"), snap.SSH.State, snap.Containers, len(snap.Tunnels))
+	fmt.Fprintf(&b, "ssh %s · %d container(s) · %d tunnel(s)\n",
+		snap.SSH.State, snap.Containers, len(snap.Tunnels))
 	if snap.DiscoveryError != "" {
 		fmt.Fprintf(&b, "  discovery error: %s\n", snap.DiscoveryError)
 	}

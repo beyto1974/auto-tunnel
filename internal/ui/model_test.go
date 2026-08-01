@@ -268,6 +268,22 @@ func TestLogPaneTogglesAndShowsRecentLines(t *testing.T) {
 	}
 }
 
+func TestZeroSizedTerminalKeepsTheTableUsable(t *testing.T) {
+	m := newTestModel(t, newFakeActions())
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 0, Height: 0})
+	m = updated.(Model)
+
+	if m.height <= 0 || m.width <= 0 {
+		t.Fatalf("size collapsed to %dx%d", m.width, m.height)
+	}
+	view := m.View()
+	for _, name := range []string{"db", "dns", "web"} {
+		if !strings.Contains(view, name) {
+			t.Errorf("row %q vanished when the terminal reported no size\n---\n%s", name, view)
+		}
+	}
+}
+
 func TestQuitReturnsQuitCommand(t *testing.T) {
 	m := newTestModel(t, newFakeActions())
 	if _, cmd := press(t, m, "q"); cmd == nil {

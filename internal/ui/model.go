@@ -71,7 +71,14 @@ func (m Model) Init() tea.Cmd { return nil }
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+		// A terminal that reports no size (a pty with none set, for instance)
+		// would otherwise collapse the table to a single row.
+		if msg.Width > 0 {
+			m.width = msg.Width
+		}
+		if msg.Height > 0 {
+			m.height = msg.Height
+		}
 		return m, nil
 
 	case SnapshotMsg:
