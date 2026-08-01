@@ -10,8 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mustiko/auto-tunnel/internal/discovery"
-	"github.com/mustiko/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/discovery"
+	"github.com/beyto1974/auto-tunnel/internal/sanitize"
+	"github.com/beyto1974/auto-tunnel/internal/state"
 )
 
 // Dialer is the slice of *ssh.Client the forwarder needs, kept narrow so tests
@@ -208,7 +209,7 @@ func (f *forwarder) untrack(c net.Conn) {
 
 func (f *forwarder) setError(err error) {
 	f.errMu.Lock()
-	f.lastErr = err.Error()
+	f.lastErr = sanitize.Error(err)
 	f.errMu.Unlock()
 }
 

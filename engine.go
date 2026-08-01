@@ -6,10 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mustiko/auto-tunnel/internal/discovery"
-	"github.com/mustiko/auto-tunnel/internal/sshconn"
-	"github.com/mustiko/auto-tunnel/internal/state"
-	"github.com/mustiko/auto-tunnel/internal/tunnel"
+	"github.com/beyto1974/auto-tunnel/internal/discovery"
+	"github.com/beyto1974/auto-tunnel/internal/sanitize"
+	"github.com/beyto1974/auto-tunnel/internal/sshconn"
+	"github.com/beyto1974/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/tunnel"
 )
 
 // engine drives discovery and reconciliation, and publishes snapshots. It is the
@@ -86,12 +87,15 @@ func (e *engine) poll(ctx context.Context) {
 	result, err := e.disc.Discover(ctx, client)
 	if err != nil {
 		if ctx.Err() == nil {
-			e.logger.Warn("discovery failed", "err", err)
-			e.setDiscoveryError(err.Error())
+			// Remote stderr reaches this message, so it is scrubbed before it
+			// can reach a terminal via the banner or the log pane.
+			e.setDiscoveryError(sanitize.Error(err))
+			e.logger.Warn("discovery failed", "err", e.discoveryError())
 		}
 		return
 	}
-	for _, w := range result.Warnings {
+	warnings := sanitize.Strings(result.Warnings)
+	for _, w := range warnings {
 		e.logger.Warn("discovery warning", "detail", w)
 	}
 
@@ -99,7 +103,7 @@ func (e *engine) poll(ctx context.Context) {
 
 	e.mu.Lock()
 	e.containers = result.Containers
-	e.warnings = result.Warnings
+	e.warnings = warnings
 	e.discoveryErr = ""
 	e.lastScan = time.Now()
 	e.mu.Unlock()
@@ -142,6 +146,12 @@ func (e *engine) setDiscoveryError(msg string) {
 	e.mu.Lock()
 	e.discoveryErr = msg
 	e.mu.Unlock()
+}
+
+func (e *engine) discoveryError() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.discoveryErr
 }
 
 func (e *engine) setNextScan(t time.Time) {

@@ -8,8 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/mustiko/auto-tunnel/internal/logbuf"
-	"github.com/mustiko/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/logbuf"
+	"github.com/beyto1974/auto-tunnel/internal/state"
 )
 
 // Actions is what the dashboard can ask the engine to do.

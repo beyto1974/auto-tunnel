@@ -1,8 +1,11 @@
 # build output
 /auto-tunnel
 
-# runtime logs
+# runtime logs — these record the remote host, user, and container names
 *.log
+
+# coverage profiles (coverage.svg is committed on purpose, for the README badge)
+coverage.out
 
 # tooling
 .tokensave/

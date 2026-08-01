@@ -1,5 +1,8 @@
 # auto-tunnel
 
+[![CI](https://github.com/beyto1974/auto-tunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/beyto1974/auto-tunnel/actions/workflows/ci.yml)
+![coverage](coverage.svg)
+
 Watch a remote server's Docker containers over SSH and automatically forward every
 published container port to your local machine. Tunnels appear when containers start,
 disappear when they stop, and survive SSH disconnects — with a live terminal dashboard
@@ -64,11 +67,11 @@ the existing SSH connection and turns the published ports into local listeners:
 | Flag | Default | Meaning |
 |---|---|---|
 | `-interval` | `5s` | How often to poll the remote Docker daemon |
-| `-bind` | `127.0.0.1` | Local address to bind forwarded ports on |
+| `-bind` | `127.0.0.1` | Local address to bind forwarded ports on (see [Security](#security) before changing it) |
 | `-fallback-base` | `20000` | First port tried when the preferred local port is taken |
 | `-include` | none | Only forward containers whose name matches this regexp |
 | `-exclude` | none | Never forward containers whose name matches this regexp |
-| `-include-unpublished` | `false` | Also forward `EXPOSE`d-but-unpublished ports, via the container IP |
+| `-include-unpublished` | `false` | Also forward `EXPOSE`d-but-unpublished ports, via the container IP — these are ports the remote operator chose *not* to publish |
 | `-docker-cmd` | `docker ps --format '{{json .}}'` | Remote command listing containers as JSON |
 | `-docker-inspect-cmd` | `docker inspect --format '…'` | Remote command prefix used to resolve container IPs |
 | `-connect-timeout` | `10s` | SSH connect timeout |
@@ -108,6 +111,26 @@ the existing SSH connection and turns the published ports into local listeners:
 
   (That needs passwordless sudo on the remote — there is no prompt to answer.)
 
+## Security
+
+- **Forwarded ports carry no authentication of their own.** They inherit whatever the
+  remote service does. The default `-bind 127.0.0.1` keeps them on your machine; any
+  other bind address republishes every discovered remote service to that network, and
+  auto-tunnel warns at startup when you do it.
+- **`-include-unpublished` overrides the remote's exposure policy.** Those ports were
+  deliberately left unpublished on the remote; forwarding them reaches services their
+  operator did not intend to expose.
+- **Host keys are never trusted on first sight.** An unknown host is a hard error with
+  the fingerprint and the `ssh-keyscan` line to accept it, because unattended
+  forwarding is exactly where a silent MITM would matter.
+- **The log file records your infrastructure**: remote host, login user, SSH port, and
+  every container name discovered there. It is created `0600`, and the default path is
+  `./auto-tunnel.log` — scrub it before attaching it to a bug report.
+- **Remote output is treated as untrusted.** Container names, images, and remote stderr
+  are stripped of terminal control sequences before they reach your terminal or the
+  log, and container IDs are validated before they can appear on a remote command line
+  (that command may be prefixed with `sudo`).
+
 ## Limitations
 
 - **UDP and SCTP cannot be forwarded.** SSH port forwarding is TCP only. Those ports are
@@ -120,8 +143,12 @@ the existing SSH connection and turns the published ports into local listeners:
 ## Development
 
 ```sh
-go test ./...          # unit tests, no remote host needed
+go test ./...                 # unit tests, no remote host needed
 go test ./... -race
+./scripts/coverage-badge.sh   # refresh coverage.svg; CI fails if it is stale
+
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...             # also run on every push by CI
 ```
 
 The design and the milestone history live in [PLAN.md](PLAN.md).

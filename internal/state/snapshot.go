@@ -6,7 +6,7 @@ package state
 import (
 	"time"
 
-	"github.com/mustiko/auto-tunnel/internal/sshconn"
+	"github.com/beyto1974/auto-tunnel/internal/sshconn"
 )
 
 // TunnelState is the display status of one forwarding entry.

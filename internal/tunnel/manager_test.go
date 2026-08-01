@@ -6,12 +6,13 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/mustiko/auto-tunnel/internal/discovery"
-	"github.com/mustiko/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/discovery"
+	"github.com/beyto1974/auto-tunnel/internal/state"
 )
 
 // echoServer stands in for a container listening on the remote host.
@@ -240,6 +241,43 @@ func TestManagerRetargetsWhenPublishedPortMoves(t *testing.T) {
 	roundTrip(t, after.LocalPort, "b")
 	if got, want := fake.lastTarget(), "127.0.0.1:9090"; got != want {
 		t.Errorf("dialed %q after retarget, want %q", got, want)
+	}
+}
+
+// TestManagerScrubsRemoteStrings covers the case where the remote host is
+// hostile: container names and images end up on the user's terminal, so an
+// escape sequence in one must never survive as far as a dashboard row.
+func TestManagerScrubsRemoteStrings(t *testing.T) {
+	echo := echoServer(t)
+	fake := &fakeSSH{to: echo.Addr().String()}
+	m, ctx := testManager(t, func() Dialer { return fake })
+
+	pm := portMap("web", 80, 8080, discovery.ProtoTCP)
+	pm.Name = "\x1b[2Jweb"
+	pm.Image = "nginx\x1b]52;c;cGF5bG9hZA==\x07"
+
+	// A UDP row and a bind failure take different code paths to the same table.
+	udp := portMap("dns", 53, 53, discovery.ProtoUDP)
+	udp.Name = "dns\rEVIL"
+
+	m.Reconcile(ctx, []discovery.PortMap{pm, udp})
+
+	rows := m.Tunnels()
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for _, row := range rows {
+		for _, field := range []string{row.Name, row.Image, row.RemoteTarget, row.LastError} {
+			if strings.ContainsAny(field, "\x1b\r\n\x07") {
+				t.Errorf("row %+v still carries a control character in %q", row, field)
+			}
+		}
+	}
+	if _, ok := rowFor(rows, "\x1b[2Jweb"); ok {
+		t.Error("the raw escaped name reached a row")
+	}
+	if _, ok := rowFor(rows, "�[2Jweb"); !ok {
+		t.Errorf("scrubbed name missing; rows: %+v", rows)
 	}
 }
 

@@ -8,8 +8,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/mustiko/auto-tunnel/internal/sshconn"
-	"github.com/mustiko/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/sshconn"
+	"github.com/beyto1974/auto-tunnel/internal/state"
 )
 
 var (

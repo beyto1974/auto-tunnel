@@ -5,6 +5,27 @@ import (
 	"time"
 )
 
+func TestIsLoopback(t *testing.T) {
+	// Anything that answers false gets a startup warning, because binding there
+	// republishes the remote's services to the network with no authentication.
+	tests := map[string]bool{
+		"":              true,
+		"127.0.0.1":     true,
+		"127.0.0.53":    true,
+		"::1":           true,
+		"localhost":     true,
+		"0.0.0.0":       false,
+		"::":            false,
+		"192.168.1.10":  false,
+		"my-laptop.lan": false,
+	}
+	for bind, want := range tests {
+		if got := isLoopback(bind); got != want {
+			t.Errorf("isLoopback(%q) = %v, want %v", bind, got, want)
+		}
+	}
+}
+
 func TestParseFlagsAcceptsFlagsAfterTheHost(t *testing.T) {
 	// The natural way to type it: host first, flags after. Go's flag package
 	// stops at the first positional, so this has to be handled explicitly.

@@ -13,7 +13,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/mustiko/auto-tunnel/internal/sshconn"
+	"github.com/beyto1974/auto-tunnel/internal/sanitize"
+	"github.com/beyto1974/auto-tunnel/internal/sshconn"
 )
 
 const (
@@ -28,6 +29,11 @@ const (
 	// to 127.0.0.1.
 	loopback = "127.0.0.1"
 )
+
+// validContainerID gates what may be interpolated into the remote inspect
+// command. Docker IDs are lowercase hex, so this rejects nothing real while
+// keeping shell metacharacters out of a command line that may run under sudo.
+var validContainerID = regexp.MustCompile(`^[0-9a-f]{6,64}$`)
 
 // Options configures a Discoverer.
 type Options struct {
@@ -134,9 +140,18 @@ func (d *Discoverer) Discover(ctx context.Context, client *ssh.Client) (*Result,
 	}
 
 	if len(needIP) > 0 {
-		ips, err := d.containerIPs(ctx, client, dedupe(needIP))
-		if err != nil {
-			result.Warnings = append(result.Warnings, err.Error())
+		ids, rejected := filterIDs(dedupe(needIP))
+		for _, bad := range rejected {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("ignoring container id %q: not a docker id", sanitize.String(bad)))
+		}
+		var ips map[string]string
+		if len(ids) > 0 {
+			var err error
+			ips, err = d.containerIPs(ctx, client, ids)
+			if err != nil {
+				result.Warnings = append(result.Warnings, err.Error())
+			}
 		}
 		result.Maps = attachContainerIPs(result.Maps, ips, &result.Warnings)
 	}
@@ -161,8 +176,23 @@ func (d *Discoverer) keep(name string) bool {
 	return true
 }
 
+// filterIDs splits ids into those safe to put on a remote command line and
+// those that are not. The inspect command is run through the remote shell, and
+// the README suggests prefixing it with sudo, so an id carrying shell
+// metacharacters would be command execution rather than a bad lookup.
+func filterIDs(ids []string) (safe, rejected []string) {
+	for _, id := range ids {
+		if validContainerID.MatchString(id) {
+			safe = append(safe, id)
+			continue
+		}
+		rejected = append(rejected, id)
+	}
+	return safe, rejected
+}
+
 // containerIPs resolves the first network IP of each container, keyed by the
-// full container ID.
+// full container ID. Callers must pass ids that filterIDs accepted.
 func (d *Discoverer) containerIPs(ctx context.Context, client *ssh.Client, ids []string) (map[string]string, error) {
 	cmd := d.opts.InspectCommand + " " + strings.Join(ids, " ")
 	out, err := sshconn.RunCommand(ctx, client, cmd)

@@ -18,12 +18,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/mustiko/auto-tunnel/internal/discovery"
-	"github.com/mustiko/auto-tunnel/internal/logbuf"
-	"github.com/mustiko/auto-tunnel/internal/sshconn"
-	"github.com/mustiko/auto-tunnel/internal/state"
-	"github.com/mustiko/auto-tunnel/internal/tunnel"
-	"github.com/mustiko/auto-tunnel/internal/ui"
+	"github.com/beyto1974/auto-tunnel/internal/discovery"
+	"github.com/beyto1974/auto-tunnel/internal/logbuf"
+	"github.com/beyto1974/auto-tunnel/internal/sshconn"
+	"github.com/beyto1974/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/tunnel"
+	"github.com/beyto1974/auto-tunnel/internal/ui"
 )
 
 // refreshInterval is how often the dashboard is redrawn. It is independent of
@@ -66,6 +66,12 @@ func run() error {
 	}
 	if logFile != nil {
 		defer logFile.Close()
+	}
+
+	if !isLoopback(cfg.bind) {
+		logger.Warn("binding forwarded ports off loopback: every discovered remote service "+
+			"becomes reachable from this network with no authentication", "bind", cfg.bind)
+		fmt.Fprintf(os.Stderr, "auto-tunnel: warning: -bind %s exposes every forwarded port to the network\n", cfg.bind)
 	}
 
 	target, err := sshconn.ResolveTarget(cfg.target)
@@ -198,6 +204,20 @@ func render(cfg *config, snap state.Snapshot) string {
 	return b.String()
 }
 
+// isLoopback reports whether forwarded ports stay on this machine. An empty
+// bind is the allocator's default, which is loopback.
+func isLoopback(bind string) bool {
+	if bind == "" {
+		return true
+	}
+	ip := net.ParseIP(bind)
+	if ip == nil {
+		// A hostname could resolve anywhere; treat it as exposed and warn.
+		return strings.EqualFold(bind, "localhost")
+	}
+	return ip.IsLoopback()
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -287,7 +307,9 @@ func newLogger(cfg *config, logs *logbuf.Buffer) (*os.File, *slog.Logger, error)
 		}
 		return nil, slog.New(logbuf.NewHandler(slog.NewTextHandler(os.Stderr, opts), logs)), nil
 	}
-	f, err := os.OpenFile(cfg.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// 0600: the log records the remote host, the login user, and every container
+	// name discovered there, which is nobody else's business on a shared machine.
+	f, err := os.OpenFile(cfg.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open log file %s: %w", cfg.logPath, err)
 	}

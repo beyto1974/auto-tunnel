@@ -1,4 +1,4 @@
-module github.com/mustiko/auto-tunnel
+module github.com/beyto1974/auto-tunnel
 
 go 1.25.0
 

@@ -9,9 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mustiko/auto-tunnel/internal/discovery"
-	"github.com/mustiko/auto-tunnel/internal/sshconn"
-	"github.com/mustiko/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/discovery"
+	"github.com/beyto1974/auto-tunnel/internal/sanitize"
+	"github.com/beyto1974/auto-tunnel/internal/sshconn"
+	"github.com/beyto1974/auto-tunnel/internal/state"
 )
 
 // Manager keeps the set of live local listeners equal to what discovery reports.
@@ -57,7 +58,7 @@ func SSHDialer(conn *sshconn.Conn) DialerFunc {
 func (m *Manager) Reconcile(ctx context.Context, maps []discovery.PortMap) {
 	desired := make(map[string]discovery.PortMap, len(maps))
 	for _, pm := range maps {
-		desired[pm.Key()] = pm
+		desired[pm.Key()] = scrub(pm)
 	}
 
 	var toStop []*forwarder
@@ -173,6 +174,17 @@ func (m *Manager) Close() {
 	for _, f := range forwarders {
 		f.stop()
 	}
+}
+
+// scrub strips terminal control sequences from the strings that came off the
+// remote host, once, at the point where discovery output becomes state the UI
+// and the log will print. Doing it here means every row builder below, both
+// renderers, and the log file all get clean text.
+func scrub(pm discovery.PortMap) discovery.PortMap {
+	pm.Name = sanitize.String(pm.Name)
+	pm.Image = sanitize.String(pm.Image)
+	pm.TargetHost = sanitize.String(pm.TargetHost)
+	return pm
 }
 
 func unsupportedRow(pm discovery.PortMap) state.Tunnel {

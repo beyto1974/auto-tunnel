@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/beyto1974/auto-tunnel/internal/sanitize"
 )
 
 const (
@@ -225,7 +227,9 @@ func (c *Conn) setDisconnected(reason error) {
 	c.status.Since = time.Now()
 	c.status.RTT = 0
 	if reason != nil {
-		c.status.LastError = reason.Error()
+		// A dial failure can carry the server's banner, so it is scrubbed
+		// before the UI renders it.
+		c.status.LastError = sanitize.Error(reason)
 	}
 	c.readyCh = make(chan struct{})
 }
@@ -240,7 +244,7 @@ func (c *Conn) recordFailure(err error) {
 	c.status.State = StateReconnecting
 	c.status.Attempts++
 	if err != nil {
-		c.status.LastError = err.Error()
+		c.status.LastError = sanitize.Error(err)
 	}
 }
 
