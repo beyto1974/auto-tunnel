@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +31,25 @@ import (
 // refreshInterval is how often the dashboard is redrawn. It is independent of
 // the discovery interval so counters stay lively between polls.
 const refreshInterval = 500 * time.Millisecond
+
+// version is stamped at release time with -ldflags "-X main.version=v1.2.3".
+// Builds that skip the ldflag fall back to the VCS metadata Go embeds, so a
+// `go install ...@v1.2.3` binary still reports its real version.
+var version = "dev"
+
+// errVersionRequested reports that -version was given, so run can print the
+// version and exit successfully instead of treating it as a usage error.
+var errVersionRequested = errors.New("version requested")
+
+func resolveVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
+}
 
 type config struct {
 	target             string
@@ -56,6 +77,10 @@ func main() {
 func run() error {
 	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
+		if errors.Is(err, errVersionRequested) {
+			fmt.Printf("auto-tunnel %s\n", resolveVersion())
+			return nil
+		}
 		return err
 	}
 
@@ -231,6 +256,7 @@ func truncate(s string, n int) string {
 func parseFlags(args []string) (*config, error) {
 	cfg := &config{}
 	var includePattern, excludePattern string
+	var showVersion bool
 
 	fs := flag.NewFlagSet("auto-tunnel", flag.ContinueOnError)
 	fs.StringVar(&cfg.logPath, "log", "auto-tunnel.log", "log file path (\"-\" writes to stderr)")
@@ -245,6 +271,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.BoolVar(&cfg.includeUnpublished, "include-unpublished", false, "also forward EXPOSEd-but-unpublished ports via the container IP")
 	fs.BoolVar(&cfg.noTUI, "no-tui", false, "print plain text instead of the live dashboard")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "log at debug level")
+	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "usage: auto-tunnel [flags] <host>\n\n")
 		fmt.Fprintf(fs.Output(), "  <host> is an ssh_config alias or user@host[:port]\n\n")
@@ -264,6 +291,11 @@ func parseFlags(args []string) (*config, error) {
 		}
 		positional = append(positional, rest[0])
 		args = rest[1:]
+	}
+	// -version stands alone, so it has to be answered before the host argument
+	// is required.
+	if showVersion {
+		return nil, errVersionRequested
 	}
 	if len(positional) != 1 {
 		fs.Usage()

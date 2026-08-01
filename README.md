@@ -19,11 +19,35 @@ ACTIVE       web                    nginx:alpine      8080         127.0.0.1:808
 ↑/↓ select · p pause · r rescan · s sort (name) · / filter · l log · q quit
 ```
 
-## Build
+## Install
+
+Linux and macOS, amd64 and arm64. Windows is not supported: auto-tunnel finds your key through
+`SSH_AUTH_SOCK`, which Windows OpenSSH does not set — it exposes the agent as a named pipe instead.
+
+**Prebuilt binary.** Every `v*` tag publishes archives and a `checksums.txt` to the
+[releases page](https://github.com/beyto1974/auto-tunnel/releases). The repository is private, so
+downloads are authenticated — run `gh auth login` first.
+
+```sh
+gh release download --repo beyto1974/auto-tunnel --pattern '*linux_amd64*'
+tar -xzf auto-tunnel_*_linux_amd64.tar.gz
+install -m755 auto-tunnel ~/.local/bin/
+```
+
+**With the Go toolchain.** `GOPRIVATE` keeps the module proxy out of the loop, which it has to be for a
+private repository:
+
+```sh
+GOPRIVATE=github.com/beyto1974/* go install github.com/beyto1974/auto-tunnel@latest
+```
+
+**From source.**
 
 ```sh
 go build -o auto-tunnel .
 ```
+
+`auto-tunnel -version` prints the build version.
 
 ## Usage
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -84,6 +85,17 @@ func TestParseFlagsRejectsWrongArgumentCount(t *testing.T) {
 		if _, err := parseFlags(args); err == nil {
 			t.Errorf("parseFlags(%v) succeeded, want an error", args)
 		}
+	}
+}
+
+func TestParseFlagsVersionNeedsNoHost(t *testing.T) {
+	// -version has to short-circuit before the host argument is enforced,
+	// otherwise `auto-tunnel -version` fails asking for a host.
+	if _, err := parseFlags([]string{"-version"}); !errors.Is(err, errVersionRequested) {
+		t.Errorf("parseFlags(-version) = %v, want errVersionRequested", err)
+	}
+	if v := resolveVersion(); v == "" {
+		t.Error("resolveVersion returned an empty string")
 	}
 }
 

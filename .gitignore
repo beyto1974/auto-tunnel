@@ -1,5 +1,6 @@
 # build output
 /auto-tunnel
+/dist/
 
 # runtime logs — these record the remote host, user, and container names
 *.log
