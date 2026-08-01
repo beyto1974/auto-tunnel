@@ -26,32 +26,14 @@ Linux and macOS, amd64 and arm64. Windows is not supported: auto-tunnel finds yo
 
 ### Prebuilt binary
 
-Every `v*` tag publishes archives and a `checksums.txt` to the
-[releases page](https://github.com/beyto1974/auto-tunnel/releases). No Go toolchain needed; the binaries
-are statically linked and depend on nothing.
-
-The repository is private, so downloads are authenticated. Run `gh auth login` once, then:
-
-```sh
-gh release download --repo beyto1974/auto-tunnel --pattern '*linux_amd64*'
-tar -xzf auto-tunnel_linux_amd64.tar.gz
-install -m755 auto-tunnel ~/.local/bin/
-```
-
-Substitute `linux_arm64`, `darwin_amd64`, or `darwin_arm64` as needed, or drop `--pattern` to fetch every
-archive plus `checksums.txt`.
-
-<details>
-<summary>curl, if the repository is ever made public</summary>
-
-Archive names carry no version, so `latest/download` always resolves to the newest release:
+Archive names carry no version, so `latest/download` always points at the newest release:
 
 ```sh
 curl -fsSL https://github.com/beyto1974/auto-tunnel/releases/latest/download/auto-tunnel_linux_amd64.tar.gz \
   | tar -xz -C ~/.local/bin auto-tunnel
 ```
 
-Detecting the platform instead of hardcoding it:
+Swap in `linux_arm64`, `darwin_amd64`, or `darwin_arm64`, or let the shell work it out:
 
 ```sh
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -60,24 +42,22 @@ curl -fsSL "https://github.com/beyto1974/auto-tunnel/releases/latest/download/au
   | tar -xz -C ~/.local/bin auto-tunnel
 ```
 
-This will **not** work while the repository is private: GitHub serves private release assets only from
-the API, and only to a request carrying a token *and* `Accept: application/octet-stream`, which means
-resolving the asset id first. `gh release download` does all of that for you, so prefer it.
-</details>
-
-Verify a download against the published checksums:
+The binaries are statically linked and need no Go toolchain. Every `v*` tag also publishes a
+`checksums.txt` alongside the archives on the
+[releases page](https://github.com/beyto1974/auto-tunnel/releases); to check a download against it, keep
+the archive instead of piping it straight into `tar`:
 
 ```sh
-gh release download --repo beyto1974/auto-tunnel --pattern 'checksums.txt'
-sha256sum -c checksums.txt --ignore-missing
+base=https://github.com/beyto1974/auto-tunnel/releases/latest/download
+curl -fsSLO "$base/auto-tunnel_linux_amd64.tar.gz"
+curl -fsSL "$base/checksums.txt" | sha256sum -c --ignore-missing
+tar -xzf auto-tunnel_linux_amd64.tar.gz -C ~/.local/bin auto-tunnel
 ```
 
 ### With the Go toolchain
 
-`GOPRIVATE` keeps the module proxy out of the loop, which it has to be for a private repository:
-
 ```sh
-GOPRIVATE=github.com/beyto1974/* go install github.com/beyto1974/auto-tunnel@latest
+go install github.com/beyto1974/auto-tunnel@latest
 ```
 
 ### From source
@@ -86,7 +66,7 @@ GOPRIVATE=github.com/beyto1974/* go install github.com/beyto1974/auto-tunnel@lat
 go build -o auto-tunnel .
 ```
 
-`auto-tunnel -version` prints the build version.
+`auto-tunnel -version` prints the build version, whichever way you installed it.
 
 ## Usage
 
