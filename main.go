@@ -16,11 +16,19 @@ import (
 	"syscall"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/mustiko/auto-tunnel/internal/discovery"
+	"github.com/mustiko/auto-tunnel/internal/logbuf"
 	"github.com/mustiko/auto-tunnel/internal/sshconn"
 	"github.com/mustiko/auto-tunnel/internal/state"
 	"github.com/mustiko/auto-tunnel/internal/tunnel"
+	"github.com/mustiko/auto-tunnel/internal/ui"
 )
+
+// refreshInterval is how often the dashboard is redrawn. It is independent of
+// the discovery interval so counters stay lively between polls.
+const refreshInterval = 500 * time.Millisecond
 
 type config struct {
 	target             string
@@ -34,6 +42,7 @@ type config struct {
 	include            *regexp.Regexp
 	exclude            *regexp.Regexp
 	includeUnpublished bool
+	noTUI              bool
 	verbose            bool
 }
 
@@ -50,7 +59,8 @@ func run() error {
 		return err
 	}
 
-	logFile, logger, err := newLogger(cfg)
+	logs := logbuf.New(500)
+	logFile, logger, err := newLogger(cfg, logs)
 	if err != nil {
 		return err
 	}
@@ -70,71 +80,81 @@ func run() error {
 	defer stop()
 
 	conn := sshconn.New(target, cfg.dialTimeout, logger)
-	done := make(chan struct{})
+	connDone := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(connDone)
 		conn.Run(ctx)
 	}()
 
 	fmt.Printf("auto-tunnel: connecting to %s\n", target)
 	if _, err := conn.WaitReady(ctx); err != nil {
 		stop()
-		<-done
+		<-connDone
 		return err
 	}
-	fmt.Printf("auto-tunnel: connected, polling docker every %s (Ctrl-C to stop)\n", cfg.interval)
 
-	watchErr := watch(ctx, cfg, conn, logger)
+	eng := newEngine(cfg, conn, logger)
+	engDone := make(chan struct{})
+	engCtx, engStop := context.WithCancel(ctx)
+	go func() {
+		defer close(engDone)
+		eng.run(engCtx)
+	}()
+
+	if cfg.noTUI {
+		err = runPlain(ctx, cfg, eng)
+	} else {
+		err = runTUI(ctx, eng, logs)
+	}
+
+	// Tear down in order: stop polling and close tunnels, then the SSH link.
+	engStop()
+	<-engDone
 	stop()
-	<-done
-	return watchErr
+	<-connDone
+	return err
 }
 
-// watch polls the remote Docker daemon, keeps the tunnel set in sync with what
-// it finds, and prints the table whenever it changes.
-func watch(ctx context.Context, cfg *config, conn *sshconn.Conn, logger *slog.Logger) error {
-	disc := discovery.New(discovery.Options{
-		PSCommand:          cfg.psCommand,
-		InspectCommand:     cfg.inspectCommand,
-		Include:            cfg.include,
-		Exclude:            cfg.exclude,
-		IncludeUnpublished: cfg.includeUnpublished,
-		Log:                logger,
-	})
-	alloc := tunnel.NewAllocator(cfg.bind, cfg.fallbackBase, tunnel.DefaultFallbackSize)
-	manager := tunnel.NewManager(tunnel.SSHDialer(conn), alloc, logger)
-	defer manager.Close()
+// runTUI renders the live dashboard until the user quits or a signal arrives.
+func runTUI(ctx context.Context, eng *engine, logs *logbuf.Buffer) error {
+	program := tea.NewProgram(ui.New(eng, logs), tea.WithAltScreen(), tea.WithContext(ctx))
 
-	ticker := time.NewTicker(cfg.interval)
-	defer ticker.Stop()
-
-	var previous, lastErr string
-	for {
-		client := conn.Client()
-		if client == nil {
-			if lastErr != "ssh-down" {
-				fmt.Println("auto-tunnel: ssh connection down, local ports stay bound while it reconnects")
-				lastErr = "ssh-down"
-			}
-		} else {
-			result, err := disc.Discover(ctx, client)
-			switch {
-			case err != nil && ctx.Err() == nil:
-				if msg := err.Error(); msg != lastErr {
-					fmt.Fprintf(os.Stderr, "auto-tunnel: %v\n", err)
-					logger.Warn("discovery failed", "err", err)
-					lastErr = msg
-				}
-			case err == nil:
-				lastErr = ""
-				for _, w := range result.Warnings {
-					logger.Warn("discovery warning", "detail", w)
-				}
-				manager.Reconcile(ctx, result.Maps)
+	feedDone := make(chan struct{})
+	go func() {
+		defer close(feedDone)
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
+		for {
+			program.Send(ui.SnapshotMsg(eng.snapshot()))
+			select {
+			case <-ticker.C:
+			case <-ctx.Done():
+				return
 			}
 		}
+	}()
 
-		if summary := render(cfg, manager.Tunnels()); summary != previous {
+	_, err := program.Run()
+	<-feedDone
+	if err != nil && ctx.Err() != nil {
+		// A signal tearing the program down is a normal exit, not a failure.
+		return nil
+	}
+	return err
+}
+
+// runPlain prints the tunnel table whenever it changes. It exists for scripting
+// and for debugging the layers underneath the TUI.
+func runPlain(ctx context.Context, cfg *config, eng *engine) error {
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
+
+	fmt.Printf("auto-tunnel: connected, polling docker every %s (Ctrl-C to stop)\n", cfg.interval)
+
+	var previous string
+	for {
+		snap := eng.snapshot()
+		if summary := render(cfg, snap); summary != previous {
 			fmt.Print(summary)
 			previous = summary
 		}
@@ -150,11 +170,15 @@ func watch(ctx context.Context, cfg *config, conn *sshconn.Conn, logger *slog.Lo
 
 // render formats the tunnel table. Its output doubles as a change key: identical
 // text means nothing worth reporting moved. Byte counters are deliberately left
-// out so idle traffic does not redraw the table on every poll.
-func render(cfg *config, tunnels []state.Tunnel) string {
+// out so ordinary traffic does not redraw the table on every refresh.
+func render(cfg *config, snap state.Snapshot) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n%d tunnel(s)\n", len(tunnels))
-	for _, t := range tunnels {
+	fmt.Fprintf(&b, "\n[%s] ssh %s · %d container(s) · %d tunnel(s)\n",
+		time.Now().Format("15:04:05"), snap.SSH.State, snap.Containers, len(snap.Tunnels))
+	if snap.DiscoveryError != "" {
+		fmt.Fprintf(&b, "  discovery error: %s\n", snap.DiscoveryError)
+	}
+	for _, t := range snap.Tunnels {
 		local := "-"
 		if t.LocalPort != 0 {
 			local = net.JoinHostPort(cfg.bind, strconv.Itoa(t.LocalPort))
@@ -199,6 +223,7 @@ func parseFlags() (*config, error) {
 	fs.StringVar(&includePattern, "include", "", "only forward containers whose name matches this regexp")
 	fs.StringVar(&excludePattern, "exclude", "", "never forward containers whose name matches this regexp")
 	fs.BoolVar(&cfg.includeUnpublished, "include-unpublished", false, "also forward EXPOSEd-but-unpublished ports via the container IP")
+	fs.BoolVar(&cfg.noTUI, "no-tui", false, "print plain text instead of the live dashboard")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "log at debug level")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "usage: auto-tunnel [flags] <host>\n\n")
@@ -234,9 +259,10 @@ func parseFlags() (*config, error) {
 	return cfg, nil
 }
 
-// newLogger sends logs to a file by default: once the TUI owns the terminal,
-// anything written to stdout corrupts the rendered frame.
-func newLogger(cfg *config) (*os.File, *slog.Logger, error) {
+// newLogger sends logs to a file by default: the TUI owns the terminal, so
+// anything written to stdout would corrupt the rendered frame. Records are also
+// mirrored into an in-memory buffer for the dashboard's log pane.
+func newLogger(cfg *config, logs *logbuf.Buffer) (*os.File, *slog.Logger, error) {
 	level := slog.LevelInfo
 	if cfg.verbose {
 		level = slog.LevelDebug
@@ -244,11 +270,14 @@ func newLogger(cfg *config) (*os.File, *slog.Logger, error) {
 	opts := &slog.HandlerOptions{Level: level}
 
 	if cfg.logPath == "-" || cfg.logPath == "" {
-		return nil, slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+		if !cfg.noTUI {
+			return nil, nil, fmt.Errorf(`-log - writes to stderr, which the dashboard would overwrite; use -no-tui or a log file`)
+		}
+		return nil, slog.New(logbuf.NewHandler(slog.NewTextHandler(os.Stderr, opts), logs)), nil
 	}
 	f, err := os.OpenFile(cfg.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open log file %s: %w", cfg.logPath, err)
 	}
-	return f, slog.New(slog.NewTextHandler(f, opts)), nil
+	return f, slog.New(logbuf.NewHandler(slog.NewTextHandler(f, opts), logs)), nil
 }
