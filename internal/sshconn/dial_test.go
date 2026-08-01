@@ -1,9 +1,49 @@
 package sshconn
 
 import (
+	"fmt"
+	"os"
 	"os/user"
 	"testing"
 )
+
+// TestMain points HOME at an empty directory for every test in the package.
+// ResolveTarget consults ssh_config.Get, which parses the real ~/.ssh/config of
+// whoever runs the suite, and expandTilde resolves against the same home. Without
+// this, results — and coverage — depend on the developer's SSH setup, and a
+// machine that happens to define a matching Host entry sees different behaviour
+// from a clean CI runner. ssh_config caches the parsed file behind a sync.Once,
+// so this has to happen before any test touches it.
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "sshconn-home")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "creating temp home: %v\n", err)
+		os.Exit(1)
+	}
+	os.Setenv("HOME", home)
+	code := m.Run()
+	os.RemoveAll(home) // os.Exit skips deferred calls
+	os.Exit(code)
+}
+
+func TestAppendUnique(t *testing.T) {
+	// ssh_config can name the same IdentityFile more than once, directly and
+	// through a default, and each duplicate would otherwise become another
+	// pointless key load at connect time.
+	var got []string
+	for _, v := range []string{"a", "b", "a", "c", "b"} {
+		got = appendUnique(got, v)
+	}
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("appendUnique produced %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("appendUnique produced %v, want %v", got, want)
+		}
+	}
+}
 
 func TestResolveTargetExplicitForms(t *testing.T) {
 	me, err := user.Current()

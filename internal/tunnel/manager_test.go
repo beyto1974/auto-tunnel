@@ -335,6 +335,17 @@ func TestManagerDegradedWhileSSHIsDown(t *testing.T) {
 	}
 	c.Close()
 
+	// The connection is handled on its own goroutine, so wait for the failure to
+	// surface rather than racing past it. Without this the assertion below is
+	// whatever the scheduler happened to do, and the error path is covered only
+	// some of the time.
+	row = waitForRow(t, m, "web", "record why the connection failed", func(tn state.Tunnel) bool {
+		return tn.LastError != ""
+	})
+	if !strings.Contains(row.LastError, "ssh connection is down") {
+		t.Errorf("LastError = %q, want it to explain that ssh is down", row.LastError)
+	}
+
 	mu.Lock()
 	up = true
 	mu.Unlock()
