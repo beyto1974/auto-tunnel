@@ -54,7 +54,7 @@ func main() {
 }
 
 func run() error {
-	cfg, err := parseFlags()
+	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
 		return err
 	}
@@ -208,7 +208,7 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func parseFlags() (*config, error) {
+func parseFlags(args []string) (*config, error) {
 	cfg := &config{}
 	var includePattern, excludePattern string
 
@@ -230,14 +230,26 @@ func parseFlags() (*config, error) {
 		fmt.Fprintf(fs.Output(), "  <host> is an ssh_config alias or user@host[:port]\n\n")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		return nil, err
+	// flag stops parsing at the first non-flag argument, which would silently
+	// ignore everything after the host. Parse repeatedly, peeling off one
+	// positional at a time, so `auto-tunnel myhost -no-tui` works too.
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
-	if fs.NArg() != 1 {
+	if len(positional) != 1 {
 		fs.Usage()
-		return nil, fmt.Errorf("expected exactly one host argument, got %d", fs.NArg())
+		return nil, fmt.Errorf("expected exactly one host argument, got %d", len(positional))
 	}
-	cfg.target = fs.Arg(0)
+	cfg.target = positional[0]
 
 	if cfg.interval <= 0 {
 		return nil, fmt.Errorf("-interval must be positive, got %s", cfg.interval)
