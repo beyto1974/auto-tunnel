@@ -5,7 +5,16 @@ published container port to your local machine. Tunnels appear when containers s
 disappear when they stop, and survive SSH disconnects — with a live terminal dashboard
 showing the state of each one.
 
-> Status: in development. See [PLAN.md](PLAN.md) for the design and milestone list.
+```
+auto-tunnel · deploy@10.0.0.5:22 · ssh connected 4ms · up 12m · next scan 3s · 3 container(s) · 3 tunnel(s): 1 active, 1 idle, 0 degraded, 1 broken
+
+STATE        CONTAINER              IMAGE             LOCAL        REMOTE                   CONNS         IN        OUT
+LISTENING    db                     postgres:16       25432        127.0.0.1:5432               0         0B         0B
+UNSUPPORTED  dns                    coredns:latest    -            127.0.0.1:53                 0         0B         0B
+ACTIVE       web                    nginx:alpine      8080         127.0.0.1:8080               2      2.0KB       512B
+
+↑/↓ select · p pause · r rescan · s sort (name) · / filter · l log · q quit
+```
 
 ## Build
 
@@ -17,20 +26,102 @@ go build -o auto-tunnel .
 
 ```sh
 auto-tunnel myserver                 # host alias from ~/.ssh/config
-auto-tunnel user@10.0.0.5:2222       # explicit user/host/port
+auto-tunnel deploy@10.0.0.5:2222     # explicit user/host/port
+auto-tunnel myserver -include '^api' # only containers whose name starts with api
 ```
 
-Full flag reference and keybindings are documented once the corresponding milestones land.
+It runs in the foreground. `q` or `Ctrl-C` shuts everything down cleanly.
+
+## How it works
+
+Every `-interval` (5s by default) auto-tunnel runs `docker ps` on the remote host over
+the existing SSH connection and turns the published ports into local listeners:
+
+- **Local port choice.** It tries the same port number the container publishes on the
+  remote (remote 5432 → local 5432). If that port is already busy locally, it takes the
+  next free port from `-fallback-base` onwards (20000+) and shows the real mapping in the
+  table. A container that restarts keeps the local port it had, even if its published
+  port changed — so anything already pointed at that port keeps working.
+- **Reconciliation.** Only genuinely new, removed, or re-targeted ports cause a change.
+  Unrelated container churn never disturbs a working tunnel.
+- **Disconnects.** If SSH drops, local ports stay bound (shown as `DEGRADED`) while the
+  connection is retried with exponential backoff. Local port numbers never move under
+  your feet, and traffic resumes as soon as the link is back.
+
+### Tunnel states
+
+| State | Meaning |
+|---|---|
+| `ACTIVE` | At least one connection is currently flowing |
+| `LISTENING` | Local port is bound and idle |
+| `DEGRADED` | Port is bound but SSH is down, so new connections cannot get through yet |
+| `PAUSED` | You stopped this tunnel from accepting connections (`p`) |
+| `ERROR` | No local port could be bound; the reason is shown under the table |
+| `UNSUPPORTED` | Discovered but not forwardable — a UDP or SCTP port |
+
+## Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-interval` | `5s` | How often to poll the remote Docker daemon |
+| `-bind` | `127.0.0.1` | Local address to bind forwarded ports on |
+| `-fallback-base` | `20000` | First port tried when the preferred local port is taken |
+| `-include` | none | Only forward containers whose name matches this regexp |
+| `-exclude` | none | Never forward containers whose name matches this regexp |
+| `-include-unpublished` | `false` | Also forward `EXPOSE`d-but-unpublished ports, via the container IP |
+| `-docker-cmd` | `docker ps --format '{{json .}}'` | Remote command listing containers as JSON |
+| `-docker-inspect-cmd` | `docker inspect --format '…'` | Remote command prefix used to resolve container IPs |
+| `-connect-timeout` | `10s` | SSH connect timeout |
+| `-log` | `auto-tunnel.log` | Log file path (`-` writes to stderr, requires `-no-tui`) |
+| `-no-tui` | `false` | Print plain text instead of the live dashboard |
+| `-verbose` | `false` | Log at debug level |
+
+## Keys
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` (or `k` / `j`) | Move the selection |
+| `g` / `G` | Jump to the first / last row |
+| `p` | Pause or resume the selected tunnel |
+| `r` | Force an immediate rescan |
+| `s` | Cycle sorting: name → local port → traffic |
+| `/` | Filter rows (enter applies, esc clears) |
+| `l` | Toggle the log pane |
+| `q` / `Ctrl-C` | Quit |
 
 ## Requirements
 
 - SSH access to the remote host, with the key loaded in `ssh-agent` (or referenced by
-  `IdentityFile` in `~/.ssh/config`)
-- The remote host must be in `~/.ssh/known_hosts` — unknown host keys are rejected
-- The remote user must be able to run `docker ps` (typically via membership in the
-  `docker` group)
+  `IdentityFile` in `~/.ssh/config`). Host aliases, `User`, `Port`, `IdentityFile`, and
+  single-hop `ProxyJump` are read from `~/.ssh/config`.
+- The remote host must already be in `~/.ssh/known_hosts`. Unknown host keys are
+  rejected rather than trusted on first sight; the error tells you the fingerprint and
+  the `ssh-keyscan` command to accept it.
+- The remote user must be able to run `docker ps`, normally via membership in the
+  `docker` group. If it needs sudo:
+
+  ```sh
+  auto-tunnel myserver \
+    -docker-cmd "sudo docker ps --format '{{json .}}'" \
+    -docker-inspect-cmd "sudo docker inspect --format '{{.Id}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'"
+  ```
+
+  (That needs passwordless sudo on the remote — there is no prompt to answer.)
 
 ## Limitations
 
-- UDP published ports cannot be forwarded — SSH port forwarding is TCP only. They are
-  listed in the dashboard but not tunneled.
+- **UDP and SCTP cannot be forwarded.** SSH port forwarding is TCP only. Those ports are
+  listed as `UNSUPPORTED` rather than silently dropped.
+- **One remote host per process.** Run a second instance for a second host.
+- **Published port ranges are capped at 64 ports** per range, so one careless `-p` on the
+  remote cannot open hundreds of local listeners.
+- Chained `ProxyJump` (`a,b`) is not supported; a single jump host is.
+
+## Development
+
+```sh
+go test ./...          # unit tests, no remote host needed
+go test ./... -race
+```
+
+The design and the milestone history live in [PLAN.md](PLAN.md).

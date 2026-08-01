@@ -1,173 +1,143 @@
-# auto-tunnel — Plan
+# auto-tunnel — design and status
 
 ## Context
 
-Greenfield. `/home/mustiko/claude/auto-tunnel` empty, not git repo.
+Problem: the remote server runs Docker containers. Reaching them from a local machine
+meant hand-writing `ssh -L` per port, redoing it every time a container started, stopped,
+or changed port, with no way to see which tunnel was still alive. `autossh` is not
+container-aware and was not installed.
 
-Problem: remote server run Docker containers. Reaching them from local machine mean hand-writing `ssh -L` per port, redoing it every time container start/stop/change port, and no way to see which tunnel alive. `autossh` not installed and it not container-aware anyway.
+Goal: one Go binary. Point it at a remote host. It watches remote `docker ps`, opens a
+local TCP tunnel for every published container port, closes tunnels when containers die,
+survives SSH drops, and shows a live table in the terminal.
 
-Goal: one Go binary. Point at remote host. It watch remote `docker ps`, open local TCP tunnel for every published container port, close tunnel when container die, survive SSH drops, and show live table in terminal.
+Decisions:
 
-Decisions locked by user:
-- Discovery: Docker-aware (remote `docker ps`), not `ss` scan
-- Language: Go, single static binary, native SSH (no shelling out to `ssh`)
-- Monitoring: terminal TUI
+- Discovery: Docker-aware (remote `docker ps`), not an `ss` port scan
+- Language: Go, single static binary, native SSH — no shelling out to the `ssh` client
+- Monitoring: terminal TUI (bubbletea + lipgloss)
 - Run mode: foreground process, no systemd
-- Hosts: single remote per process
+- Hosts: one remote per process
 - Auth: ssh-agent + `~/.ssh/config`
-- Port conflict: same port if free, else auto-offset from fallback base
+- Port conflict: same port if free, otherwise auto-offset from a fallback base
 
-## Usage target
-
-```
-auto-tunnel myserver              # alias resolved from ~/.ssh/config
-auto-tunnel user@10.0.0.5:2222
-```
-
-Flags:
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--interval` | `5s` | docker poll period |
-| `--bind` | `127.0.0.1` | local listen address |
-| `--fallback-base` | `20000` | start of offset range on conflict |
-| `--include` / `--exclude` | none | regex on container name |
-| `--include-unpublished` | false | also tunnel EXPOSEd-only ports via container IP |
-| `--docker-cmd` | `docker ps --format '{{json .}}'` | override for `sudo docker` / `podman` |
-| `--log` | `./auto-tunnel.log` | log file (TUI owns stdout) |
-| `--no-tui` | false | plain line output, for scripting/debug |
+User-facing usage, flags, and keys are documented in [README.md](README.md).
 
 ## Layout
 
 ```
 auto-tunnel/
-  go.mod
-  main.go                  flags, wiring, signal handling
+  main.go                  flags, logging, wiring, shutdown
+  engine.go                poll/reconcile loop, snapshot publishing, UI actions
   internal/
     sshconn/
       dial.go              ssh_config + agent + knownhosts -> *ssh.Client
-      keepalive.go         keepalive@openssh.com ping, RTT, reconnect w/ backoff
+      keepalive.go         keepalive@openssh.com ping, RTT, reconnect with backoff
+      exec.go              run a remote command, surface stderr in the error
     discovery/
-      docker.go            run remote cmd, parse output
-      ports.go             Ports-string parser (unit tested)
-      types.go             Container, PortMap
+      docker.go            poll `docker ps`, apply filters, resolve container IPs
+      ports.go             Ports-column parser (unit tested)
+      types.go             PortSpec, PortMap, tunnel keys
     tunnel/
       manager.go           reconcile desired vs live set
-      forwarder.go         listener -> ssh.Dial -> io.Copy + counters
+      forwarder.go         listener -> ssh.Dial -> io.Copy with counters
       portalloc.go         same-port-else-offset allocator
     state/
-      snapshot.go          immutable snapshot sent to UI
+      snapshot.go          immutable view handed to the renderer
+    logbuf/
+      logbuf.go            slog handler mirroring records into a ring buffer
     ui/
-      model.go             bubbletea Model, Update, keys
-      view.go              lipgloss render, table + header + log pane
+      model.go             bubbletea model, keys, filter, sorting
+      view.go              lipgloss rendering of header, table, log pane
 ```
 
-Deps:
-- `golang.org/x/crypto/ssh` + `/agent` + `/knownhosts`
-- `github.com/kevinburke/ssh_config`
-- `github.com/charmbracelet/bubbletea`, `bubbles/table`, `lipgloss`
+Dependencies: `golang.org/x/crypto/ssh` (+ `agent`, `knownhosts`), `golang.org/x/term`,
+`github.com/kevinburke/ssh_config`, `github.com/charmbracelet/bubbletea`,
+`github.com/charmbracelet/lipgloss`.
 
-## Design
+## Design notes
 
-### 1. SSH layer (`internal/sshconn`)
+**SSH layer.** `ResolveTarget` parses `user@host:port` and fills the gaps from
+`~/.ssh/config` (`HostName`, `User`, `Port`, `IdentityFile`, single-hop `ProxyJump`).
+Auth prefers ssh-agent, then lazily loads on-disk keys — lazily so an encrypted key only
+prompts for a passphrase if the agent could not authenticate first. Host keys are checked
+against `known_hosts` with no trust-on-first-use, since unattended forwarding is exactly
+where a silent MITM window would matter. `Conn` keeps the connection alive with
+`keepalive@openssh.com` pings (which also give the RTT shown in the header) and
+reconnects with jittered exponential backoff, 1s to 30s.
 
-`Dial(target string)`:
-1. Parse `user@host:port`. If no user/port, look up alias in `~/.ssh/config` via `ssh_config.Get(alias, "HostName"|"User"|"Port"|"IdentityFile"|"ProxyJump")`.
-2. Auth chain, in order: ssh-agent from `$SSH_AUTH_SOCK` -> `IdentityFile` from ssh_config -> `~/.ssh/id_ed25519`, `id_rsa`. Encrypted key with no agent = prompt passphrase before TUI starts.
-3. Host key check via `knownhosts.New(~/.ssh/known_hosts)`. Unknown host = hard fail with the fingerprint printed, plus hint to `ssh-keyscan`. No `InsecureIgnoreHostKey`.
-4. `ProxyJump` support optional — if present, dial jump host first, `Dial` through it.
+**Discovery.** One `docker ps --format '{{json .}}'` per tick — a single round trip, no
+`docker inspect` fan-out unless unpublished ports are being forwarded. The Ports column
+parser handles published ports, collapsed ranges, exposed-only ports, and the duplicate
+IPv4/IPv6 rows of a single publish. Published ports are dialed as `127.0.0.1:hostPort`
+from the remote side, which works even for ports published only to loopback. A discovery
+failure is surfaced as a banner and leaves existing tunnels running.
 
-`Keepalive` goroutine: every 15s `client.SendRequest("keepalive@openssh.com", true, nil)`, measure RTT. Two consecutive failures = connection dead.
+**Tunnels.** Binding *is* the reservation, so two tunnels cannot race into the same local
+port. The tunnel key is `containerID:containerPort/proto` — tied to the container port,
+not the host port, so a container republished on a different host port is recognised as
+the same tunnel and reclaims its local port. Local listeners deliberately stay bound
+across SSH outages so local port numbers never move under the user's feet.
 
-Reconnect: exponential backoff 1s..30s, jitter. On new client, tunnel manager swaps client reference — **local listeners stay open across reconnect**, they just fail dials meanwhile. That keeps local port numbers stable for whatever apps already point at them. State during outage = `DEGRADED`.
-
-### 2. Discovery (`internal/discovery`)
-
-Each tick, one SSH exec session running `docker ps --format '{{json .}}'`. One round trip, no `docker inspect` fan-out.
-
-Parse each JSON line; `Ports` field is a string like:
-```
-0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp, 8080/tcp
-```
-Regex `(?:(\[[^\]]+\]|[\d.]+):)?(\d+)->(\d+)/(tcp|udp)` plus bare `(\d+)/(tcp|udp)` for unpublished.
-
-Rules:
-- Dedupe by remote host port (IPv4 + IPv6 rows collapse to one).
-- `udp` published ports listed in TUI as `UDP (unsupported)` — SSH direct-tcpip is TCP only. Never silently dropped.
-- Published port -> tunnel target `127.0.0.1:hostPort` on remote (works even when published to `127.0.0.1` only, since dial originates on the remote).
-- Unpublished port, only with `--include-unpublished`: needs container IP, so an extra `docker inspect -f '{{.Id}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'` for those containers; target `containerIP:containerPort`.
-- Apply `--include`/`--exclude` regex on container name.
-- Discovery error (docker missing, permission denied) does not kill the process — surfaced as header banner in TUI, existing tunnels stay up.
-
-Output: `[]PortMap{ContainerID, Name, Image, RemotePort, ContainerPort, Proto}`. Stable key = `containerID:containerPort`.
-
-### 3. Tunnel manager (`internal/tunnel`)
-
-Reconcile loop on each discovery result:
-- desired keys minus live keys = start
-- live keys minus desired keys = stop (close listener, close active conns)
-- unchanged = leave alone (never churn a working tunnel)
-
-Port allocation (`portalloc.go`): try `net.Listen(bind, remotePort)`. Success = reservation, no TOCTOU window. On `EADDRINUSE`, walk `fallbackBase..fallbackBase+999` for first free. Remember mapping per key so a container restart reclaims the same local port when possible.
-
-Forwarder per accepted conn:
-```
-localConn := listener.Accept()
-remoteConn := sshClient.Dial("tcp", target)
-go copy w/ counters both directions
-```
-Counters per tunnel: `ActiveConns`, `TotalConns`, `BytesIn`, `BytesOut`, `LastError`. `atomic` for counters, mutex only around the tunnel map.
-
-Tunnel states: `LISTENING`, `ACTIVE` (>=1 conn), `DEGRADED` (SSH down), `ERROR` (bind or dial failed persistently), `STOPPED`.
-
-### 4. TUI (`internal/ui`)
-
-Manager pushes a `state.Snapshot` on a channel every 500ms; `main.go` forwards to `tea.Program.Send`. UI never touches manager internals — snapshot only, so no data race.
-
-Header: `host  •  SSH: connected 4ms  •  up 12m  •  next scan 3s  •  N tunnels`. Red banner line when SSH down or discovery erroring.
-
-Table columns: `CONTAINER | IMAGE | REMOTE | LOCAL | STATE | CONNS | IN | OUT | NOTE`.
-
-Keys: `q` quit (graceful close all), `r` force rescan now, `p` pause/resume selected tunnel, `/` filter rows, `s` cycle sort (name/local port/traffic), `l` toggle log pane, `↑/↓` navigate.
-
-**Logging must go to file, never stdout** — writing to stdout corrupts the bubbletea frame. `--no-tui` flips it back to line-oriented stdout for debugging.
-
-Shutdown: SIGINT/SIGTERM and `q` both run the same path — close listeners, close conns, close SSH, restore terminal.
-
-## Repo setup (step 0)
-
-- `mkdir -p /home/mustiko/claude/auto-tunnel && git init` (dir does not exist yet)
-- `.gitignore`: `auto-tunnel`, `*.log`, `.tokensave/`
-- Copy this plan to `/home/mustiko/claude/auto-tunnel/PLAN.md` — lives with the code, updated as milestones land
-- `README.md` at root: what it does, install/build, usage examples, full flag table, TUI keybindings, SSH auth requirements, Docker permission note, UDP limitation. Written for a user, not a developer — PLAN.md holds the internals. Stub it in milestone 1, fill it out in milestone 7
-- Commit per logical iteration, one commit per milestone below (`feat:` / `test:` / `chore:`), message written normal English, not caveman
+**UI.** The engine publishes immutable snapshots twice a second; the UI only reads
+snapshots and calls back for actions, so rendering can never race the forwarders. Logs go
+to a file and an in-memory ring buffer, never stdout — writing to stdout would corrupt the
+frame.
 
 ## Milestones
 
-Each numbered item = one commit.
+All shipped, one commit each:
 
-1. `git init`, `PLAN.md`, `README.md` stub, `.gitignore`, `go mod init`, flag parsing, `sshconn.Dial` + keepalive. Prove: connect and print remote `uname -a`, exit.
-2. `discovery` package + `ports.go` parser with table-driven unit tests over real `docker ps` output strings. Prove: `--no-tui` prints discovered port maps each tick.
-3. `tunnel` manager + portalloc + forwarder. Prove: `curl localhost:PORT` reaches remote container.
-4. Reconcile churn correctness: start/stop containers on remote, tunnels appear/vanish, untouched ones keep their conns.
-5. Reconnect: kill network / `ssh` server, confirm backoff, DEGRADED state, listeners survive, recovery re-dials.
-6. TUI on top. Keys, sorting, log pane.
-7. Polish: `--include-unpublished`, regex filters, full `README.md`, `PLAN.md` updated to match what shipped.
+1. Repo scaffold, flags, `sshconn.Dial` + keepalive + reconnect
+2. `discovery` package and Ports-column parser with table-driven tests
+3. `tunnel` manager, port allocator, forwarder
+4. Reconcile churn correctness (covered by manager tests)
+5. Reconnect behaviour: DEGRADED state, listeners survive, recovery re-dials
+6. TUI: table, keys, sorting, filter, log pane
+7. Polish: target-parsing tests, full README
+
+Milestones 4 and 5 produced no separate commit: their behaviour is implemented in the
+manager and verified by `internal/tunnel` tests rather than by extra code.
 
 ## Verification
 
-- Unit: `go test ./internal/discovery` — Ports-string parser (IPv4+IPv6 dupes, UDP, unpublished, multi-port, empty). `go test ./internal/tunnel` — allocator picks same port, then offset, then rejects exhausted range.
-- Manual, needs remote host with Docker:
-  1. `go build -o auto-tunnel . && ./auto-tunnel <host> --no-tui` — confirm discovery list matches remote `docker ps`.
-  2. `nc -z 127.0.0.1 <local>` / `curl` a real HTTP container. Confirm bytes counters move.
-  3. Remote `docker stop <c>` — row disappears within one interval, local port released.
-  4. Remote `docker start <c>` — row returns, same local port.
-  5. Bind conflict: run local `nc -l 5432` first, start tool, confirm offset port used and shown in TUI.
-  6. Kill SSH (`sudo ss -K` on remote or drop wifi) — state DEGRADED, backoff logged, recovers without changing local ports.
-  7. `q` and `Ctrl-C` both exit clean, no orphan listeners (`ss -tlnp | grep auto-tunnel` empty).
+Unit tests, no remote host required:
 
-## Risks
+```sh
+go test ./... -race
+```
 
-- `docker ps` needs remote user in `docker` group; else `--docker-cmd "sudo docker ps ..."` with NOPASSWD sudo. Error must be readable, not a raw exit-1.
-- UDP services can't be tunneled by SSH. Displayed, not forwarded.
-- Polling every 5s is N SSH exec sessions/min. Cheap, but `docker events` streaming is the later upgrade if it matters — design keeps discovery behind an interface so swapping is local.
+- `internal/discovery` — Ports parser: IPv4/IPv6 duplicates, UDP, exposed-only, ranges,
+  oversized ranges, malformed entries, plus a column captured verbatim from a real
+  Temporal container
+- `internal/tunnel` — allocator (preferred port, fallback, sticky reclaim, exhausted
+  range) and the full data path against an in-process dialer: round trips and byte
+  accounting, churn isolation, retargeting, pause, degraded-then-recovered, teardown
+- `internal/ui` — header and table rendering, banners for SSH and Docker failures, key
+  handling, filtering, sorting, selection stability across snapshots
+- `internal/sshconn` — target parsing, including IPv6 and malformed input
+
+Manual checks against a real remote host with Docker (not yet run — no remote host was
+available in the environment where this was built):
+
+1. `go build -o auto-tunnel . && ./auto-tunnel <host> -no-tui` — the listed ports match
+   remote `docker ps`
+2. `curl` a forwarded HTTP container; byte counters move
+3. Remote `docker stop <c>` — the row disappears within one interval, the local port is
+   released
+4. Remote `docker start <c>` — the row returns on the same local port
+5. Occupy the preferred port locally first — the tunnel takes a fallback port and the
+   table shows the real mapping
+6. Kill the network — state goes DEGRADED, backoff is logged, recovery does not change
+   local port numbers
+7. `q` and `Ctrl-C` both exit clean, leaving no orphan listeners
+
+## Risks and follow-ups
+
+- `docker ps` needs the remote user in the `docker` group, or `-docker-cmd` with
+  passwordless sudo. The failure is surfaced with the remote stderr, not a bare exit code.
+- UDP and SCTP services cannot be tunneled by SSH. They are displayed, not forwarded.
+- Polling costs one SSH exec session per interval. Cheap, but `docker events` streaming is
+  the obvious upgrade; discovery is isolated enough that swapping it is a local change.
+- The allocator remembers every tunnel key it has seen so restarts reclaim their port.
+  On a host with very heavy container churn that map grows slowly and is never pruned.
