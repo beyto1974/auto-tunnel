@@ -22,6 +22,25 @@ const (
 	maxBackoff        = 30 * time.Second
 )
 
+// timings are the intervals Run works to. They are a field rather than the
+// constants above so tests can drive the reconnect and keepalive paths in
+// milliseconds instead of waiting out a real 15-second cycle.
+type timings struct {
+	keepaliveInterval time.Duration
+	keepaliveTimeout  time.Duration
+	minBackoff        time.Duration
+	maxBackoff        time.Duration
+}
+
+func defaultTimings() timings {
+	return timings{
+		keepaliveInterval: keepaliveInterval,
+		keepaliveTimeout:  keepaliveTimeout,
+		minBackoff:        minBackoff,
+		maxBackoff:        maxBackoff,
+	}
+}
+
 // State is the lifecycle of the managed SSH connection.
 type State string
 
@@ -49,6 +68,7 @@ type Conn struct {
 	target  *Target
 	timeout time.Duration
 	log     *slog.Logger
+	timings timings
 
 	mu      sync.RWMutex
 	client  *ssh.Client
@@ -65,6 +85,7 @@ func New(t *Target, timeout time.Duration, log *slog.Logger) *Conn {
 		target:  t,
 		timeout: timeout,
 		log:     log,
+		timings: defaultTimings(),
 		status:  Status{State: StateConnecting, Since: time.Now()},
 		readyCh: make(chan struct{}),
 	}
@@ -77,7 +98,7 @@ func (c *Conn) Target() *Target { return c.target }
 func (c *Conn) Run(ctx context.Context) {
 	defer c.setClosed()
 
-	backoff := minBackoff
+	backoff := c.timings.minBackoff
 	for ctx.Err() == nil {
 		client, err := Dial(c.target, c.timeout)
 		if err != nil {
@@ -89,11 +110,11 @@ func (c *Conn) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
-			backoff = min(backoff*2, maxBackoff)
+			backoff = min(backoff*2, c.timings.maxBackoff)
 			continue
 		}
 
-		backoff = minBackoff
+		backoff = c.timings.minBackoff
 		c.setConnected(client)
 		c.log.Info("ssh connected", "target", c.target.String())
 
@@ -112,7 +133,7 @@ func (c *Conn) monitor(ctx context.Context, client *ssh.Client) error {
 	closed := make(chan error, 1)
 	go func() { closed <- client.Wait() }()
 
-	ticker := time.NewTicker(keepaliveInterval)
+	ticker := time.NewTicker(c.timings.keepaliveInterval)
 	defer ticker.Stop()
 
 	fails := 0
@@ -126,7 +147,7 @@ func (c *Conn) monitor(ctx context.Context, client *ssh.Client) error {
 			}
 			return err
 		case <-ticker.C:
-			rtt, err := ping(client)
+			rtt, err := ping(client, c.timings.keepaliveTimeout)
 			if err != nil {
 				fails++
 				c.log.Debug("keepalive failed", "attempt", fails, "err", err)
@@ -142,7 +163,7 @@ func (c *Conn) monitor(ctx context.Context, client *ssh.Client) error {
 }
 
 // ping measures round-trip time, bounded so a black-holed network still fails fast.
-func ping(client *ssh.Client) (time.Duration, error) {
+func ping(client *ssh.Client, timeout time.Duration) (time.Duration, error) {
 	type result struct {
 		rtt time.Duration
 		err error
@@ -156,8 +177,8 @@ func ping(client *ssh.Client) (time.Duration, error) {
 	select {
 	case r := <-done:
 		return r.rtt, r.err
-	case <-time.After(keepaliveTimeout):
-		return 0, fmt.Errorf("keepalive timed out after %s", keepaliveTimeout)
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("keepalive timed out after %s", timeout)
 	}
 }
 

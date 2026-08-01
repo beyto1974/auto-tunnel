@@ -44,12 +44,17 @@ type fakeSSH struct {
 	mu      sync.Mutex
 	targets []string
 	to      string // where every dial actually goes
+	dialErr error  // when set, every dial fails with it instead
 }
 
 func (f *fakeSSH) Dial(network, addr string) (net.Conn, error) {
 	f.mu.Lock()
 	f.targets = append(f.targets, addr)
+	dialErr := f.dialErr
 	f.mu.Unlock()
+	if dialErr != nil {
+		return nil, dialErr
+	}
 	return net.Dial(network, f.to)
 }
 
