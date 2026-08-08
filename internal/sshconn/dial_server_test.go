@@ -83,6 +83,40 @@ func TestDialReportsAHostMissingFromKnownHosts(t *testing.T) {
 	if !strings.Contains(err.Error(), "ssh-keyscan") {
 		t.Errorf("error = %v, want the recovery hint", err)
 	}
+	// The fixture never listens on 22, so the hint has to carry -p. Without it
+	// the scan records a bare-hostname entry that can never satisfy a
+	// [host]:port lookup, and following the advice changes nothing.
+	if want := "-p " + strconv.Itoa(srv.Port()); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %v, want the hint to carry %q", err, want)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		// The banner is one line and the sanitizer turns control characters
+		// into U+FFFD, so a newline here reaches the user as garbage.
+		t.Errorf("error = %q, want a single line", err.Error())
+	}
+}
+
+func TestDialExplainsAKeyTrustedOnlyOnTheDefaultPort(t *testing.T) {
+	// The trap this message exists for: the same key is already trusted for the
+	// host, but recorded under the bare hostname, which known_hosts reads as
+	// port 22 only. The host looks known and the refusal looks inexplicable.
+	srv := sshtest.New(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	path := filepath.Join(sshtest.SSHDir(t), "known_hosts")
+	if err := os.WriteFile(path, []byte(sshtest.KnownHostsLine("127.0.0.1", srv.HostKey())), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+
+	_, err := Dial(fixtureTarget(srv), 5*time.Second)
+	if err == nil {
+		t.Fatal("Dial succeeded for a host recorded only on port 22, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "already trusted for 127.0.0.1 on port 22") {
+		t.Errorf("error = %v, want it to name the default-port entry", err)
+	}
+	if want := "-p " + strconv.Itoa(srv.Port()); !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %v, want the hint to carry %q", err, want)
+	}
 }
 
 func TestHostKeyCallbackNeedsAKnownHostsFile(t *testing.T) {

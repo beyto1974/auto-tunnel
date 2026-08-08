@@ -26,6 +26,15 @@ const DefaultDialTimeout = 10 * time.Second
 // defaultKeyNames are tried when neither the agent nor ssh_config supplies a key.
 var defaultKeyNames = []string{"id_ed25519", "id_ecdsa", "id_rsa"}
 
+const (
+	// defaultSSHPort is assumed when a target spec names no port.
+	defaultSSHPort = 22
+	// defaultSSHPortStr is the same port as known_hosts sees it. Entries for
+	// port 22 are stored under the bare hostname; every other port is stored
+	// as [host]:port, and the two forms never match each other.
+	defaultSSHPortStr = "22"
+)
+
 // Target is a fully resolved SSH destination.
 type Target struct {
 	Spec          string // exactly what the user typed
@@ -115,7 +124,7 @@ func ResolveTarget(spec string) (*Target, error) {
 		t.User = u.Username
 	}
 	if t.Port == 0 {
-		t.Port = 22
+		t.Port = defaultSSHPort
 	}
 	for _, name := range defaultKeyNames {
 		if p := expandTilde("~/.ssh/" + name); fileExists(p) {
@@ -283,19 +292,48 @@ func hostKeyCallback() (ssh.HostKeyCallback, error) {
 		if err == nil {
 			return nil
 		}
-		host, _, splitErr := net.SplitHostPort(hostname)
+		host, port, splitErr := net.SplitHostPort(hostname)
 		if splitErr != nil {
-			host = hostname
+			host, port = hostname, ""
 		}
 		var ke *knownhosts.KeyError
 		if errors.As(err, &ke) && len(ke.Want) == 0 {
-			return fmt.Errorf("host key for %s is not in known_hosts (%s %s)\n"+
-				"if you trust it, run: ssh-keyscan -H %s >> ~/.ssh/known_hosts",
-				hostname, key.Type(), ssh.FingerprintSHA256(key), host)
+			return fmt.Errorf("host key for %s is not in known_hosts (%s %s)%s; if you trust it, run: %s",
+				hostname, key.Type(), ssh.FingerprintSHA256(key),
+				defaultPortNote(base, host, port, remote, key),
+				keyscanHint(host, port))
 		}
 		return fmt.Errorf("host key verification failed for %s (offered %s %s): %w",
 			hostname, key.Type(), ssh.FingerprintSHA256(key), err)
 	}, nil
+}
+
+// keyscanHint is the ssh-keyscan command that would record this host. The -p is
+// the part that is easy to miss: known_hosts entries are port-qualified, so a
+// scan without it writes an entry under the bare hostname, which can never
+// satisfy a lookup for [host]:port — following the hint changes nothing and the
+// identical refusal comes back.
+func keyscanHint(host, port string) string {
+	if port == "" || port == defaultSSHPortStr {
+		return fmt.Sprintf("ssh-keyscan -H %s >> ~/.ssh/known_hosts", host)
+	}
+	return fmt.Sprintf("ssh-keyscan -H -p %s %s >> ~/.ssh/known_hosts", port, host)
+}
+
+// defaultPortNote names the confusing case: this exact key is already trusted
+// for the host on port 22, so the host looks perfectly known and the refusal
+// looks like a bug. It returns "" whenever that is not what happened, including
+// when the host is genuinely unknown or is on the default port already.
+func defaultPortNote(base ssh.HostKeyCallback, host, port string, remote net.Addr, key ssh.PublicKey) string {
+	if port == "" || port == defaultSSHPortStr {
+		return ""
+	}
+	if base(net.JoinHostPort(host, defaultSSHPortStr), remote, key) != nil {
+		return ""
+	}
+	return fmt.Sprintf("; this exact key is already trusted for %s on port %s, but known_hosts "+
+		"entries are port-qualified, so port %s needs its own [%s]:%s entry",
+		host, defaultSSHPortStr, port, host, port)
 }
 
 func expandTilde(path string) string {
