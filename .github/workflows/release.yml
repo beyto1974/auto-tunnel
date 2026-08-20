@@ -51,7 +51,7 @@ jobs:
             # one-line curl install possible. The binary knows its own version.
             tar -czf "dist/auto-tunnel_${goos}_${goarch}.tar.gz" \
               -C build auto-tunnel \
-              -C "$GITHUB_WORKSPACE" README.md
+              -C "$GITHUB_WORKSPACE" README.md LICENSE
           done
           (cd dist && sha256sum *.tar.gz > checksums.txt)
           ls -l dist
