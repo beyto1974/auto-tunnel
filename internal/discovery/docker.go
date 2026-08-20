@@ -119,6 +119,8 @@ func (d *Discoverer) Discover(ctx context.Context, client *ssh.Client) (*Result,
 				continue
 			}
 			pm := PortMap{
+				Source:        SourceDocker,
+				Owner:         c.ID,
 				ContainerID:   c.ID,
 				Name:          name,
 				Image:         c.Image,

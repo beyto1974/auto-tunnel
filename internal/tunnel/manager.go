@@ -19,18 +19,22 @@ import (
 // It never tears down a working tunnel that is still wanted: only genuinely new,
 // gone, or re-targeted ports cause a change.
 type Manager struct {
-	dial  DialerFunc
-	alloc *Allocator
-	log   *slog.Logger
+	dial      DialerFunc
+	alloc     *Allocator
+	log       *slog.Logger
+	probeHTTP bool // ask each forwarded port whether it speaks HTTP
 
 	mu         sync.Mutex
 	forwarders map[string]*forwarder
 	problems   map[string]state.Tunnel // rows that exist but carry no traffic
+	offered    map[string]state.Tunnel // rows waiting for the user to enable them
 }
 
 // NewManager creates a manager. dial supplies the current SSH client and must
-// return nil while the connection is down.
-func NewManager(dial DialerFunc, alloc *Allocator, log *slog.Logger) *Manager {
+// return nil while the connection is down. probeHTTP decides whether each
+// forwarded port is asked what it speaks; only forwarded ports are ever probed,
+// so a row the user merely looked at is never touched.
+func NewManager(dial DialerFunc, alloc *Allocator, log *slog.Logger, probeHTTP bool) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -38,8 +42,10 @@ func NewManager(dial DialerFunc, alloc *Allocator, log *slog.Logger) *Manager {
 		dial:       dial,
 		alloc:      alloc,
 		log:        log,
+		probeHTTP:  probeHTTP,
 		forwarders: map[string]*forwarder{},
 		problems:   map[string]state.Tunnel{},
+		offered:    map[string]state.Tunnel{},
 	}
 }
 
@@ -86,13 +92,34 @@ func (m *Manager) Reconcile(ctx context.Context, maps []discovery.PortMap) {
 			delete(m.problems, key)
 		}
 	}
+	for key := range m.offered {
+		if _, wanted := desired[key]; !wanted {
+			delete(m.offered, key)
+		}
+	}
 
 	// Add what is missing.
 	for key, pm := range desired {
 		if !pm.Forwardable() {
+			delete(m.offered, key)
 			m.problems[key] = unsupportedRow(pm)
 			continue
 		}
+		if pm.Offered {
+			// Listed, not forwarded. A row the user has just switched off still
+			// has a live forwarder, which has to give its local port back — the
+			// allocator remembers the assignment, so switching it on again
+			// reclaims the same port.
+			if f, live := m.forwarders[key]; live {
+				m.log.Info("tunnel disabled", "tunnel", key, "local_port", f.localPort)
+				toStop = append(toStop, f)
+				delete(m.forwarders, key)
+			}
+			delete(m.problems, key)
+			m.offered[key] = offeredRow(pm)
+			continue
+		}
+		delete(m.offered, key)
 		if _, live := m.forwarders[key]; live {
 			continue
 		}
@@ -108,7 +135,7 @@ func (m *Manager) Reconcile(ctx context.Context, maps []discovery.PortMap) {
 
 // start binds a local port and begins forwarding. Callers hold m.mu.
 func (m *Manager) start(ctx context.Context, key string, pm discovery.PortMap) {
-	ln, port, err := m.alloc.Listen(key, pm.RemotePort())
+	ln, port, err := m.alloc.Listen(key, pm.PreferredLocal())
 	if err != nil {
 		m.log.Error("could not bind a local port", "tunnel", key, "err", err)
 		m.problems[key] = errorRow(pm, err.Error())
@@ -116,8 +143,8 @@ func (m *Manager) start(ctx context.Context, key string, pm discovery.PortMap) {
 	}
 	delete(m.problems, key)
 
-	f := newForwarder(key, pm, ln, port, m.dial, m.log)
-	f.start(ctx)
+	f := newForwarder(key, pm, ln, port, m.alloc.Bind(), m.dial, m.log)
+	f.start(ctx, m.probeHTTP)
 	m.forwarders[key] = f
 	m.log.Info("tunnel started",
 		"tunnel", key, "container", pm.Name,
@@ -129,11 +156,14 @@ func (m *Manager) Tunnels() []state.Tunnel {
 	sshUp := m.dial() != nil
 
 	m.mu.Lock()
-	rows := make([]state.Tunnel, 0, len(m.forwarders)+len(m.problems))
+	rows := make([]state.Tunnel, 0, len(m.forwarders)+len(m.problems)+len(m.offered))
 	for _, f := range m.forwarders {
 		rows = append(rows, f.status(sshUp))
 	}
 	for _, row := range m.problems {
+		rows = append(rows, row)
+	}
+	for _, row := range m.offered {
 		rows = append(rows, row)
 	}
 	m.mu.Unlock()
@@ -187,9 +217,12 @@ func scrub(pm discovery.PortMap) discovery.PortMap {
 	return pm
 }
 
-func unsupportedRow(pm discovery.PortMap) state.Tunnel {
+// baseRow is the part of a dashboard row that comes straight from discovery,
+// shared by every row that has no forwarder of its own to describe it.
+func baseRow(pm discovery.PortMap) state.Tunnel {
 	return state.Tunnel{
 		Key:           pm.Key(),
+		Source:        string(pm.Src()),
 		Name:          pm.Name,
 		Image:         pm.Image,
 		Proto:         string(pm.Proto),
@@ -197,24 +230,31 @@ func unsupportedRow(pm discovery.PortMap) state.Tunnel {
 		RemotePort:    pm.RemotePort(),
 		RemoteTarget:  pm.Target(),
 		Published:     pm.Published(),
-		State:         state.TunnelUnsupported,
-		LastError:     "ssh forwards tcp only",
 		Since:         time.Now(),
 	}
 }
 
+// unsupportedRow and errorRow are Enabled: the user asked for these ports and
+// something else is in the way, which is a different thing from a row that is
+// waiting to be picked.
+func unsupportedRow(pm discovery.PortMap) state.Tunnel {
+	row := baseRow(pm)
+	row.Enabled = true
+	row.State = state.TunnelUnsupported
+	row.LastError = "ssh forwards tcp only"
+	return row
+}
+
 func errorRow(pm discovery.PortMap, reason string) state.Tunnel {
-	return state.Tunnel{
-		Key:           pm.Key(),
-		Name:          pm.Name,
-		Image:         pm.Image,
-		Proto:         string(pm.Proto),
-		ContainerPort: pm.ContainerPort,
-		RemotePort:    pm.RemotePort(),
-		RemoteTarget:  pm.Target(),
-		Published:     pm.Published(),
-		State:         state.TunnelError,
-		LastError:     reason,
-		Since:         time.Now(),
-	}
+	row := baseRow(pm)
+	row.Enabled = true
+	row.State = state.TunnelError
+	row.LastError = reason
+	return row
+}
+
+func offeredRow(pm discovery.PortMap) state.Tunnel {
+	row := baseRow(pm)
+	row.State = state.TunnelOffered
+	return row
 }

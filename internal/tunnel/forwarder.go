@@ -6,11 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/beyto1974/auto-tunnel/internal/discovery"
+	"github.com/beyto1974/auto-tunnel/internal/probe"
 	"github.com/beyto1974/auto-tunnel/internal/sanitize"
 	"github.com/beyto1974/auto-tunnel/internal/state"
 )
@@ -20,6 +22,16 @@ import (
 type Dialer interface {
 	Dial(network, addr string) (net.Conn, error)
 }
+
+// maxConcurrentProbes bounds how many ports are being identified at once. A run
+// with -host-ports all can start a hundred tunnels in the same second, and
+// letting each one open its own SSH channel immediately would burst the
+// connection for no benefit: the answers are only needed as fast as a user can
+// read them.
+const maxConcurrentProbes = 8
+
+// probeSlots is the semaphore enforcing that bound across every forwarder.
+var probeSlots = make(chan struct{}, maxConcurrentProbes)
 
 // DialerFunc returns the currently usable dialer, or nil while SSH is down.
 // It must return an untyped nil rather than a nil *ssh.Client, otherwise the
@@ -31,12 +43,14 @@ type forwarder struct {
 	key       string
 	portMap   discovery.PortMap
 	localPort int
+	bind      string
 	listener  net.Listener
 	client    DialerFunc
 	log       *slog.Logger
 
 	since  time.Time
 	paused atomic.Bool
+	scheme atomic.Value // probe.Scheme, once the port has been asked what it speaks
 
 	activeConns atomic.Int64
 	totalConns  atomic.Int64
@@ -53,11 +67,12 @@ type forwarder struct {
 	conns  map[net.Conn]struct{} // live local connections, closed on shutdown
 }
 
-func newForwarder(key string, pm discovery.PortMap, ln net.Listener, localPort int, client DialerFunc, log *slog.Logger) *forwarder {
+func newForwarder(key string, pm discovery.PortMap, ln net.Listener, localPort int, bind string, client DialerFunc, log *slog.Logger) *forwarder {
 	return &forwarder{
 		key:       key,
 		portMap:   pm,
 		localPort: localPort,
+		bind:      bind,
 		listener:  ln,
 		client:    client,
 		log:       log,
@@ -67,10 +82,62 @@ func newForwarder(key string, pm discovery.PortMap, ln net.Listener, localPort i
 	}
 }
 
-// start begins accepting connections until ctx ends or stop is called.
-func (f *forwarder) start(ctx context.Context) {
+// start begins accepting connections until ctx ends or stop is called. When
+// probing is on it also asks the remote service, once, whether it speaks HTTP.
+func (f *forwarder) start(ctx context.Context, probeHTTP bool) {
 	ctx, f.cancel = context.WithCancel(ctx)
 	go f.acceptLoop(ctx)
+	if probeHTTP {
+		go f.probe(ctx)
+	}
+}
+
+// probe identifies the service behind this tunnel so the dashboard can offer a
+// URL. It waits for SSH rather than giving up, since a tunnel started while the
+// link is down would otherwise never be identified, and it asks exactly once:
+// a port that is not a web server now is not going to become one.
+func (f *forwarder) probe(ctx context.Context) {
+	select {
+	case probeSlots <- struct{}{}:
+		defer func() { <-probeSlots }()
+	case <-ctx.Done():
+		return
+	}
+
+	for {
+		if dialer := f.client(); dialer != nil {
+			scheme := probe.Detect(ctx, dialer.Dial, f.portMap.Target(), probe.DefaultTimeout)
+			if ctx.Err() != nil {
+				return
+			}
+			f.scheme.Store(scheme)
+			if scheme != probe.SchemeNone {
+				f.log.Info("tunnel speaks http", "tunnel", f.key, "scheme", string(scheme))
+			}
+			return
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// url is the address to open in a browser, empty until a probe says the service
+// speaks HTTP. A wildcard bind is advertised as loopback: 0.0.0.0 is not
+// somewhere a browser can go.
+func (f *forwarder) url() string {
+	scheme, _ := f.scheme.Load().(probe.Scheme)
+	if scheme == probe.SchemeNone {
+		return ""
+	}
+	host := f.bind
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+	return string(scheme) + "://" + net.JoinHostPort(host, strconv.Itoa(f.localPort))
 }
 
 func (f *forwarder) acceptLoop(ctx context.Context) {
@@ -239,6 +306,8 @@ func (f *forwarder) status(sshUp bool) state.Tunnel {
 	active := f.activeConns.Load()
 	t := state.Tunnel{
 		Key:           f.key,
+		Source:        string(f.portMap.Src()),
+		Enabled:       true,
 		Name:          f.portMap.Name,
 		Image:         f.portMap.Image,
 		Proto:         string(f.portMap.Proto),
@@ -252,6 +321,7 @@ func (f *forwarder) status(sshUp bool) state.Tunnel {
 		BytesIn:       f.bytesIn.Load(),
 		BytesOut:      f.bytesOut.Load(),
 		LastError:     f.lastError(),
+		URL:           f.url(),
 		Since:         f.since,
 	}
 	switch {

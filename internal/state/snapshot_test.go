@@ -13,10 +13,11 @@ func TestCounts(t *testing.T) {
 		{State: TunnelDegraded},
 		{State: TunnelError},
 		{State: TunnelUnsupported},
+		{State: TunnelOffered},
 		{State: TunnelState("something new")}, // an unknown state must not be counted anywhere
 	}}
 
-	active, listening, degraded, broken := snap.Counts()
+	active, listening, degraded, broken, offered := snap.Counts()
 
 	if active != 2 {
 		t.Errorf("active = %d, want 2", active)
@@ -29,5 +30,9 @@ func TestCounts(t *testing.T) {
 	}
 	if broken != 2 {
 		t.Errorf("broken = %d, want 2 (ERROR + UNSUPPORTED)", broken)
+	}
+	// AVAILABLE is none of the above: nothing is bound, but nothing is wrong.
+	if offered != 1 {
+		t.Errorf("offered = %d, want 1", offered)
 	}
 }

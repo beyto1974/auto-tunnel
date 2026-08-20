@@ -14,14 +14,21 @@ import (
 
 type fakeActions struct {
 	paused   map[string]bool
+	enabled  map[string]bool
+	prefs    Prefs    // what an earlier run left behind
+	saved    []Prefs  // every preference write
+	opened   []string // urls handed to the browser
+	openErr  error    // when set, opening fails
+	bulk     []string // keys of the last bulk enablement
+	bulkOn   bool
 	rescans  int
 	lastKey  string
-	unknown  bool // report every key as not pausable
+	unknown  bool // report every key as neither pausable nor forwardable
 	toggling bool
 }
 
 func newFakeActions() *fakeActions {
-	return &fakeActions{paused: map[string]bool{}}
+	return &fakeActions{paused: map[string]bool{}, enabled: map[string]bool{}}
 }
 
 func (f *fakeActions) TogglePause(key string) (bool, bool) {
@@ -32,6 +39,41 @@ func (f *fakeActions) TogglePause(key string) (bool, bool) {
 	}
 	f.paused[key] = !f.paused[key]
 	return f.paused[key], true
+}
+
+func (f *fakeActions) SetEnabled(key string, on bool) bool {
+	f.lastKey = key
+	if f.unknown {
+		return false
+	}
+	f.enabled[key] = on
+	return true
+}
+
+func (f *fakeActions) SetEnabledAll(keys []string, on bool) int {
+	f.bulk, f.bulkOn = keys, on
+	if f.unknown {
+		return 0
+	}
+	for _, key := range keys {
+		f.enabled[key] = on
+	}
+	return len(keys)
+}
+
+func (f *fakeActions) OpenURL(url string) error {
+	f.opened = append(f.opened, url)
+	if f.openErr != nil {
+		return f.openErr
+	}
+	return nil
+}
+
+func (f *fakeActions) Prefs() Prefs { return f.prefs }
+
+func (f *fakeActions) SavePrefs(p Prefs) {
+	f.prefs = p
+	f.saved = append(f.saved, p)
 }
 
 func (f *fakeActions) Rescan() { f.rescans++ }
@@ -51,18 +93,21 @@ func testSnapshot() state.Snapshot {
 		},
 		Tunnels: []state.Tunnel{
 			{
-				Key: "web:80/tcp", Name: "web", Image: "nginx:alpine", Proto: "tcp",
+				Key: "web:80/tcp", Source: "docker", Enabled: true,
+				Name: "web", Image: "nginx:alpine", Proto: "tcp",
 				ContainerPort: 80, RemotePort: 8080, RemoteTarget: "127.0.0.1:8080",
 				LocalPort: 8080, Published: true, State: state.TunnelActive,
 				ActiveConns: 2, TotalConns: 9, BytesIn: 2048, BytesOut: 512,
 			},
 			{
-				Key: "db:5432/tcp", Name: "db", Image: "postgres:16", Proto: "tcp",
+				Key: "db:5432/tcp", Source: "docker", Enabled: true,
+				Name: "db", Image: "postgres:16", Proto: "tcp",
 				ContainerPort: 5432, RemotePort: 5432, RemoteTarget: "127.0.0.1:5432",
 				LocalPort: 25432, Published: true, State: state.TunnelListening,
 			},
 			{
-				Key: "dns:53/udp", Name: "dns", Image: "coredns:latest", Proto: "udp",
+				Key: "dns:53/udp", Source: "docker", Enabled: true,
+				Name: "dns", Image: "coredns:latest", Proto: "udp",
 				ContainerPort: 53, RemotePort: 53, RemoteTarget: "127.0.0.1:53",
 				Published: true, State: state.TunnelUnsupported,
 				LastError: "ssh forwards tcp only",
@@ -217,6 +262,11 @@ func TestSortCyclesBetweenModes(t *testing.T) {
 	m, _ = press(t, m, "s") // by traffic: web is the only row with bytes
 	if got := m.rows[0].Name; got != "web" {
 		t.Errorf("by traffic put %q first, want web", got)
+	}
+
+	m, _ = press(t, m, "s") // by remote/url: 127.0.0.1:53 sorts before :5432
+	if got := m.rows[0].Name; got != "dns" {
+		t.Errorf("by remote put %q first, want dns (127.0.0.1:53)", got)
 	}
 
 	m, _ = press(t, m, "s") // back to name
