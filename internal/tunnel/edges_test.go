@@ -50,7 +50,7 @@ func TestReconcileReportsAnUnbindablePort(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	m := NewManager(func() Dialer { return nil }, NewAllocator("127.0.0.1", fallback, 1), slog.New(slog.DiscardHandler))
+	m := NewManager(func() Dialer { return nil }, NewAllocator("127.0.0.1", fallback, 1), slog.New(slog.DiscardHandler), false)
 	t.Cleanup(m.Close)
 
 	m.Reconcile(ctx, []discovery.PortMap{portMap("web", 80, preferred, discovery.ProtoTCP)})
@@ -146,9 +146,9 @@ func TestAcceptLoopSurvivesATransientAcceptError(t *testing.T) {
 	ln := &flakyListener{failures: 1, addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}}
 	ln.released = make(chan struct{})
 
-	f := newForwarder("web:80/tcp", portMap("web", 80, 8080, discovery.ProtoTCP), ln, 8080,
+	f := newForwarder("web:80/tcp", portMap("web", 80, 8080, discovery.ProtoTCP), ln, 8080, "127.0.0.1",
 		func() Dialer { return nil }, slog.New(slog.DiscardHandler))
-	f.start(context.Background())
+	f.start(context.Background(), false)
 	t.Cleanup(f.stop)
 
 	deadline := time.Now().Add(3 * time.Second)

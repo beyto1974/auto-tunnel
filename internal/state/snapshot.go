@@ -28,11 +28,19 @@ const (
 	// TunnelUnsupported means the port was discovered but cannot be forwarded,
 	// which today means UDP or SCTP.
 	TunnelUnsupported TunnelState = "UNSUPPORTED"
+	// TunnelOffered means the port was discovered but is not being forwarded:
+	// no local port is bound until the user enables the row.
+	TunnelOffered TunnelState = "AVAILABLE"
 )
 
 // Tunnel is one row of the dashboard.
 type Tunnel struct {
-	Key           string
+	Key string
+	// Source is where the row came from: docker, host, or static.
+	Source string
+	// Enabled reports whether this row is being forwarded. A row that is listed
+	// for the user to pick is not.
+	Enabled       bool
 	Name          string
 	Image         string
 	Proto         string
@@ -47,7 +55,10 @@ type Tunnel struct {
 	BytesIn       int64
 	BytesOut      int64
 	LastError     string
-	Since         time.Time
+	// URL is where this tunnel can be opened in a browser, set only once the
+	// service has answered a probe as HTTP. Empty for everything else.
+	URL   string
+	Since time.Time
 }
 
 // Snapshot is the whole picture at one instant.
@@ -64,7 +75,7 @@ type Snapshot struct {
 }
 
 // Counts summarises tunnel states for the header line.
-func (s Snapshot) Counts() (active, listening, degraded, broken int) {
+func (s Snapshot) Counts() (active, listening, degraded, broken, offered int) {
 	for _, t := range s.Tunnels {
 		switch t.State {
 		case TunnelActive:
@@ -75,6 +86,8 @@ func (s Snapshot) Counts() (active, listening, degraded, broken int) {
 			degraded++
 		case TunnelError, TunnelUnsupported:
 			broken++
+		case TunnelOffered:
+			offered++
 		}
 	}
 	return

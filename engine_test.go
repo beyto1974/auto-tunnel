@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/beyto1974/auto-tunnel/internal/sshconn"
 	"github.com/beyto1974/auto-tunnel/internal/sshtest"
 	"github.com/beyto1974/auto-tunnel/internal/state"
+	"github.com/beyto1974/auto-tunnel/internal/ui"
 )
 
 // TestMain points HOME at an empty directory. The engine dials through
@@ -29,6 +31,9 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	os.Setenv("HOME", home)
+	// The engine now saves forwarding choices under the user's config directory
+	// by default; without this the suite would write into the developer's own.
+	os.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
 	code := m.Run()
 	os.RemoveAll(home) // os.Exit skips deferred calls
 	os.Exit(code)
@@ -355,5 +360,477 @@ func TestNewEngineAppliesTheConfiguredFilters(t *testing.T) {
 
 	if got := eng.snapshot(); got.Containers != 0 || len(got.Tunnels) != 0 {
 		t.Errorf("snapshot = %+v, want the excluded container filtered out", got)
+	}
+}
+
+// ssLines renders the output of the default listen command.
+const ssListening = `LISTEN 0 4096 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=812,fd=7))
+LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:* users:(("docker-proxy",pid=99,fd=4))
+`
+
+// remoteExec answers the docker and socket commands from fixed strings, the way
+// a real host answers two different questions over one connection.
+func remoteExec(dockerOut, listenOut string) func(string) sshtest.ExecResult {
+	return func(cmd string) sshtest.ExecResult {
+		switch {
+		case strings.HasPrefix(cmd, "docker ps"):
+			return sshtest.ExecResult{Stdout: dockerOut}
+		case strings.Contains(cmd, "ss -Hltnp"):
+			return sshtest.ExecResult{Stdout: listenOut}
+		default:
+			return sshtest.ExecResult{Stderr: "unexpected command: " + cmd, Exit: 127}
+		}
+	}
+}
+
+func rowNamed(snap state.Snapshot, name string) (state.Tunnel, bool) {
+	for _, t := range snap.Tunnels {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return state.Tunnel{}, false
+}
+
+func TestEngineForwardsHostPortsBesideContainerPorts(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsAll
+	cfg.listenCommand = discovery.DefaultListenCommand
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+
+	snap := waitForSnapshot(t, eng, "bind both sources", func(s state.Snapshot) bool {
+		return len(s.Tunnels) == 2
+	})
+
+	web, ok := rowNamed(snap, "web")
+	if !ok || web.Source != string(discovery.SourceDocker) {
+		t.Fatalf("tunnels = %+v, want the container row", snap.Tunnels)
+	}
+	pg, ok := rowNamed(snap, "postgres")
+	if !ok {
+		t.Fatalf("tunnels = %+v, want the host socket row", snap.Tunnels)
+	}
+	if pg.Source != string(discovery.SourceHost) || pg.RemoteTarget != "127.0.0.1:5432" {
+		t.Errorf("postgres row = %+v, want a host row dialed on the remote loopback", pg)
+	}
+	if pg.LocalPort == 0 {
+		t.Error("host port was discovered but never bound in -host-ports all")
+	}
+}
+
+func TestEngineDropsHostRowsThatAreReallyDockerPublishedPorts(t *testing.T) {
+	// docker-proxy listens on every published port, so 8080 shows up in both
+	// answers. Two rows for one service would race for the same local port.
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsAll
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "reconcile both sources", func(s state.Snapshot) bool {
+		return len(s.Tunnels) == 2
+	})
+
+	for _, tn := range snap.Tunnels {
+		if tn.Source == string(discovery.SourceHost) && tn.ContainerPort == 8080 {
+			t.Errorf("tunnels = %+v, want docker's own published port dropped from the host rows", snap.Tunnels)
+		}
+	}
+}
+
+func TestEngineSelectModeListsHostPortsUntilTheUserAsks(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsSelect
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "list the host port", func(s state.Snapshot) bool {
+		_, ok := rowNamed(s, "postgres")
+		return ok
+	})
+
+	pg, _ := rowNamed(snap, "postgres")
+	if pg.State != state.TunnelOffered || pg.LocalPort != 0 {
+		t.Fatalf("postgres row = %+v, want it listed without a local port", pg)
+	}
+	if pg.Enabled {
+		t.Error("a row nobody asked for reports itself as forwarded")
+	}
+
+	// The choice takes effect at once, without waiting for the next poll.
+	if !eng.SetEnabled(pg.Key, true) {
+		t.Fatalf("SetEnabled(%q) rejected a key from the snapshot", pg.Key)
+	}
+	bound := waitForSnapshot(t, eng, "bind the enabled host port", func(s state.Snapshot) bool {
+		row, ok := rowNamed(s, "postgres")
+		return ok && row.LocalPort != 0
+	})
+	row, _ := rowNamed(bound, "postgres")
+	if row.State == state.TunnelOffered || !row.Enabled {
+		t.Errorf("postgres row = %+v, want it forwarded after being enabled", row)
+	}
+
+	// And switching it back off releases the port again.
+	if !eng.SetEnabled(pg.Key, false) {
+		t.Fatal("SetEnabled could not switch the row back off")
+	}
+	waitForSnapshot(t, eng, "release the port again", func(s state.Snapshot) bool {
+		r, ok := rowNamed(s, "postgres")
+		return ok && r.LocalPort == 0
+	})
+}
+
+func TestEngineSetEnabledRejectsAnUnknownKey(t *testing.T) {
+	cfg := testConfig(t)
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ""))
+	eng.poll(t.Context())
+
+	if eng.SetEnabled("host:host:9999/tcp", true) {
+		t.Error("SetEnabled accepted a key the engine never discovered")
+	}
+}
+
+func TestEngineSetEnabledAllChangesOnlyTheKeysItIsGiven(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsSelect
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "list both sources", func(s state.Snapshot) bool {
+		return len(s.Tunnels) == 2
+	})
+	pg, _ := rowNamed(snap, "postgres")
+
+	if got := eng.SetEnabledAll([]string{pg.Key, "nothing:here:1/tcp"}, true); got != 1 {
+		t.Errorf("SetEnabledAll changed %d rows, want only the known one", got)
+	}
+	waitForSnapshot(t, eng, "bind the enabled host port", func(s state.Snapshot) bool {
+		row, ok := rowNamed(s, "postgres")
+		return ok && row.LocalPort != 0
+	})
+
+	// Asking again for what is already true changes nothing.
+	if got := eng.SetEnabledAll([]string{pg.Key}, true); got != 0 {
+		t.Errorf("SetEnabledAll changed %d rows, want none: the choice was already made", got)
+	}
+}
+
+func TestEngineDeclaredForwardsSurviveADockerFailure(t *testing.T) {
+	// A declared forward depends on no remote command, so nothing a failing
+	// `docker ps` can do should take it away.
+	cfg := testConfig(t)
+	var fail bool
+	cfg.static = mustForward(t, "db=5432")
+	eng, _ := testEngine(t, cfg, func(cmd string) sshtest.ExecResult {
+		if fail {
+			return sshtest.ExecResult{Stderr: "docker daemon not responding", Exit: 1}
+		}
+		return sshtest.ExecResult{Stdout: dockerPS("web", "0.0.0.0:8080->80/tcp")}
+	})
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "bind the declared forward", func(s state.Snapshot) bool {
+		row, ok := rowNamed(s, "db")
+		return ok && row.LocalPort != 0
+	})
+	before, _ := rowNamed(snap, "db")
+
+	fail = true
+	eng.poll(t.Context())
+
+	after := eng.snapshot()
+	db, ok := rowNamed(after, "db")
+	if !ok {
+		t.Fatalf("tunnels = %+v, want the declared forward kept", after.Tunnels)
+	}
+	if db.LocalPort != before.LocalPort {
+		t.Errorf("declared forward moved from %d to %d across a failed docker poll", before.LocalPort, db.LocalPort)
+	}
+	if _, ok := rowNamed(after, "web"); !ok {
+		t.Error("the container row was dropped by a failing poll")
+	}
+	if after.DiscoveryError == "" {
+		t.Error("DiscoveryError is empty after the failing poll")
+	}
+}
+
+func TestEngineWithoutDockerForwardsOnlyTheOtherSources(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.noDocker = true
+	cfg.hostMode = discovery.HostPortsAll
+	cfg.static = mustForward(t, "db=3306")
+	eng, _ := testEngine(t, cfg, func(cmd string) sshtest.ExecResult {
+		if strings.HasPrefix(cmd, "docker ps") {
+			t.Errorf("docker was polled under -no-docker: %q", cmd)
+			return sshtest.ExecResult{Exit: 127}
+		}
+		return sshtest.ExecResult{Stdout: ssListening}
+	})
+
+	eng.poll(t.Context())
+
+	snap := waitForSnapshot(t, eng, "bind the host and declared rows", func(s state.Snapshot) bool {
+		return len(s.Tunnels) == 3 // postgres, docker-proxy's 8080, and db
+	})
+	if snap.DiscoveryError != "" {
+		t.Errorf("DiscoveryError = %q, want none when docker is not being polled", snap.DiscoveryError)
+	}
+	for _, name := range []string{"postgres", "db"} {
+		if row, ok := rowNamed(snap, name); !ok || row.LocalPort == 0 {
+			t.Errorf("row %q = %+v, want it bound", name, row)
+		}
+	}
+}
+
+func TestEngineRemembersTheSelectionBetweenRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "selection.json")
+
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsSelect
+	cfg.selectionPath = path
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "list the host port", func(s state.Snapshot) bool {
+		_, ok := rowNamed(s, "postgres")
+		return ok
+	})
+	pg, _ := rowNamed(snap, "postgres")
+	eng.SetEnabled(pg.Key, true)
+
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat selection file: %v", err)
+	}
+	// The keys name every container and service found on the remote host.
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Errorf("selection file mode = %#o, want 0600", perm)
+	}
+
+	// A second run starts with the choice already made.
+	next := testConfig(t)
+	next.hostMode = discovery.HostPortsSelect
+	next.selectionPath = path
+	restarted, _ := testEngine(t, next, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	restarted.poll(t.Context())
+	waitForSnapshot(t, restarted, "bind the remembered host port", func(s state.Snapshot) bool {
+		row, ok := rowNamed(s, "postgres")
+		return ok && row.LocalPort != 0
+	})
+}
+
+func TestEngineIgnoresAnUnreadableSelectionFile(t *testing.T) {
+	// A corrupt file is not a reason to refuse to start: the worst case is that
+	// the user picks their ports again.
+	path := filepath.Join(t.TempDir(), "selection.json")
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := loadSelection(path, slog.New(slog.DiscardHandler)); len(got) != 0 {
+		t.Errorf("loadSelection = %v, want an empty set", got)
+	}
+	if got := loadSelection(filepath.Join(t.TempDir(), "missing.json"), slog.New(slog.DiscardHandler)); len(got) != 0 {
+		t.Errorf("loadSelection on a first run = %v, want an empty set", got)
+	}
+}
+
+func mustForward(t *testing.T, specs ...string) []discovery.PortMap {
+	t.Helper()
+	maps, err := discovery.ParseForwards(specs)
+	if err != nil {
+		t.Fatalf("ParseForwards(%v): %v", specs, err)
+	}
+	return maps
+}
+
+func TestSelectionFileName(t *testing.T) {
+	// The name has to stay recognisable — a user looking in their config
+	// directory should see which host each file belongs to.
+	for target, want := range map[string]string{
+		"deploy@10.0.0.5:22":  "deploy@10.0.0.5_22.json",
+		"myserver":            "myserver.json",
+		"root@[fe80::1]:2222": "root@_fe80__1__2222.json",
+		"":                    "default.json",
+		"/../..":              "default.json",
+	} {
+		if got := selectionFileName(target); got != want {
+			t.Errorf("selectionFileName(%q) = %q, want %q", target, got, want)
+		}
+	}
+}
+
+func TestResolveSelectionPath(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	target := &sshconn.Target{User: "deploy", Host: "10.0.0.5", Port: 22}
+
+	if got := resolveSelectionPath(SelectionOff, target, logger); got != "" {
+		t.Errorf(`resolveSelectionPath("off") = %q, want nothing remembered`, got)
+	}
+	if got := resolveSelectionPath("/tmp/mine.json", target, logger); got != "/tmp/mine.json" {
+		t.Errorf("an explicit -selection was rewritten to %q", got)
+	}
+
+	// The default is one file per target: the keys inside are not
+	// host-qualified, so a shared file would apply one host's picks to another.
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	got := resolveSelectionPath("", target, logger)
+	want := filepath.Join(dir, "auto-tunnel", selectionFileName(target.String()))
+	if got != want {
+		t.Errorf("default selection path = %q, want %q", got, want)
+	}
+	other := resolveSelectionPath("", &sshconn.Target{User: "deploy", Host: "10.0.0.9", Port: 22}, logger)
+	if other == got {
+		t.Error("two different hosts resolved to the same selection file")
+	}
+}
+
+func TestEngineRemembersTheSelectionWithoutAFlag(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsSelect
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "list the host port", func(s state.Snapshot) bool {
+		_, ok := rowNamed(s, "postgres")
+		return ok
+	})
+
+	// Nothing is written until the user actually picks something: a run that
+	// never touches the keys must leave no file behind.
+	if entries, err := os.ReadDir(filepath.Join(dir, "auto-tunnel")); err == nil && len(entries) > 0 {
+		t.Errorf("selection files %v exist before any choice was made", entries)
+	}
+
+	pg, _ := rowNamed(snap, "postgres")
+	eng.SetEnabled(pg.Key, true)
+
+	st, err := os.Stat(eng.selectionPath)
+	if err != nil {
+		t.Fatalf("stat the default selection file: %v", err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Errorf("selection file mode = %#o, want 0600", perm)
+	}
+	if dirSt, err := os.Stat(filepath.Dir(eng.selectionPath)); err != nil {
+		t.Fatalf("stat the selection directory: %v", err)
+	} else if perm := dirSt.Mode().Perm(); perm != 0o700 {
+		t.Errorf("selection directory mode = %#o, want 0700", perm)
+	}
+
+	if got := loadSelection(eng.selectionPath, slog.New(slog.DiscardHandler)); !got[pg.Key] {
+		t.Errorf("saved selection = %v, want the enabled key", got)
+	}
+}
+
+func TestEngineSelectionOffWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	cfg := testConfig(t)
+	cfg.hostMode = discovery.HostPortsSelect
+	cfg.selectionPath = SelectionOff
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ssListening))
+
+	eng.poll(t.Context())
+	snap := waitForSnapshot(t, eng, "list the host port", func(s state.Snapshot) bool {
+		_, ok := rowNamed(s, "postgres")
+		return ok
+	})
+	pg, _ := rowNamed(snap, "postgres")
+
+	// The choice still takes effect, it is just not remembered.
+	if !eng.SetEnabled(pg.Key, true) {
+		t.Fatal("SetEnabled rejected a key under -selection off")
+	}
+	waitForSnapshot(t, eng, "bind the enabled port", func(s state.Snapshot) bool {
+		row, ok := rowNamed(s, "postgres")
+		return ok && row.LocalPort != 0
+	})
+	if eng.selectionPath != "" {
+		t.Errorf("selectionPath = %q, want nothing remembered", eng.selectionPath)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auto-tunnel")); !os.IsNotExist(err) {
+		t.Errorf("a selection directory was created under -selection off: %v", err)
+	}
+}
+
+func TestEngineRemembersTheDashboardPreferences(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	cfg := testConfig(t)
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ""))
+
+	// A first run has nothing to remember, and reading that is not an error.
+	if got := eng.Prefs(); got.Sort != "" {
+		t.Errorf("Prefs on a first run = %+v, want the zero value", got)
+	}
+
+	eng.SavePrefs(ui.Prefs{Sort: "remote/url"})
+
+	path := filepath.Join(dir, "auto-tunnel", "view.json")
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat the preferences file: %v", err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Errorf("preferences mode = %#o, want 0600", perm)
+	}
+	if got := eng.Prefs(); got.Sort != "remote/url" {
+		t.Errorf("Prefs = %+v, want what was saved", got)
+	}
+
+	// The preferences are not per-target: a second host reads the same file.
+	other := testConfig(t)
+	restarted, _ := testEngine(t, other, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ""))
+	if got := restarted.Prefs(); got.Sort != "remote/url" {
+		t.Errorf("a second engine read %+v, want the shared preference", got)
+	}
+}
+
+func TestEngineSelectionOffAlsoStopsRememberingPreferences(t *testing.T) {
+	// Somebody who asked for nothing to be remembered did not mean "except the
+	// sort order".
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	cfg := testConfig(t)
+	cfg.selectionPath = SelectionOff
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ""))
+
+	eng.SavePrefs(ui.Prefs{Sort: "traffic"})
+
+	if eng.prefsPath != "" {
+		t.Errorf("prefsPath = %q, want nothing remembered", eng.prefsPath)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auto-tunnel")); !os.IsNotExist(err) {
+		t.Errorf("a config directory was created under -selection off: %v", err)
+	}
+	if got := eng.Prefs(); got.Sort != "" {
+		t.Errorf("Prefs = %+v, want the zero value", got)
+	}
+}
+
+func TestEngineIgnoresUnreadablePreferences(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "auto-tunnel"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auto-tunnel", "view.json"), []byte("{{{"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cfg := testConfig(t)
+	eng, _ := testEngine(t, cfg, remoteExec(dockerPS("web", "0.0.0.0:8080->80/tcp"), ""))
+
+	if got := eng.Prefs(); got.Sort != "" {
+		t.Errorf("Prefs = %+v, want the zero value for a corrupt file", got)
 	}
 }

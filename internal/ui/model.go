@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -16,6 +17,18 @@ import (
 type Actions interface {
 	// TogglePause flips whether a tunnel accepts new connections.
 	TogglePause(key string) (paused, ok bool)
+	// SetEnabled starts or stops forwarding one discovered port, reporting
+	// whether the key was known.
+	SetEnabled(key string, on bool) bool
+	// SetEnabledAll applies one choice to several ports, returning how many it
+	// changed.
+	SetEnabledAll(keys []string, on bool) int
+	// OpenURL hands a forwarded service's URL to the desktop's browser.
+	OpenURL(url string) error
+	// Prefs returns the dashboard settings remembered from earlier runs.
+	Prefs() Prefs
+	// SavePrefs remembers them for the next one.
+	SavePrefs(Prefs)
 	// Rescan asks for an immediate discovery poll.
 	Rescan()
 }
@@ -29,6 +42,8 @@ const (
 	sortByName sortMode = iota
 	sortByLocalPort
 	sortByTraffic
+	sortByRemote
+	sortModes // how many there are; keep last
 )
 
 func (s sortMode) String() string {
@@ -37,9 +52,40 @@ func (s sortMode) String() string {
 		return "local port"
 	case sortByTraffic:
 		return "traffic"
+	case sortByRemote:
+		return "remote/url"
 	default:
 		return "name"
 	}
+}
+
+// parseSortMode reads back what String wrote, falling back to the default for
+// anything it does not recognise — a stale or hand-edited preference file must
+// not be a startup failure.
+func parseSortMode(s string) sortMode {
+	for mode := sortMode(0); mode < sortModes; mode++ {
+		if mode.String() == s {
+			return mode
+		}
+	}
+	return sortByName
+}
+
+// Prefs are the dashboard settings that outlive a single run.
+type Prefs struct {
+	// Sort is a sortMode as String renders it.
+	Sort string `json:"sort"`
+}
+
+// sourceFilters are cycled by the "t" key. The empty string shows everything;
+// the rest match state.Tunnel.Source exactly.
+var sourceFilters = []string{"", "docker", "host", "static"}
+
+func sourceFilterName(s string) string {
+	if s == "" {
+		return "all"
+	}
+	return s
 }
 
 // Model is the bubbletea model backing the dashboard.
@@ -54,14 +100,22 @@ type Model struct {
 	cursor  int
 	sort    sortMode
 	filter  string
+	source  int  // index into sourceFilters
+	onlyOn  bool // hide the rows that are listed but not forwarded
 	editing bool // the filter prompt has focus
 	showLog bool
 	status  string // transient feedback for the last key pressed
 }
 
-// New creates a dashboard model.
+// New creates a dashboard model, picking up where the last run left off.
 func New(actions Actions, logs *logbuf.Buffer) Model {
-	return Model{actions: actions, logs: logs, width: 100, height: 30}
+	return Model{
+		actions: actions,
+		logs:    logs,
+		width:   100,
+		height:  30,
+		sort:    parseSortMode(actions.Prefs().Sort),
+	}
 }
 
 // Init satisfies tea.Model; snapshots arrive from outside the program.
@@ -136,9 +190,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = "rescanning"
 	case "p":
 		m.status = m.togglePause()
+	case "enter", " ":
+		m.status = m.toggleEnabled()
+	case "a":
+		m.status = m.toggleAllVisible()
+	case "o":
+		m.status = m.openSelected()
+	case "f":
+		m.onlyOn = !m.onlyOn
+		m.status = "showing " + m.scopeName()
+		m.refresh()
+	case "t":
+		m.source = (m.source + 1) % len(sourceFilters)
+		m.status = "showing " + sourceFilterName(sourceFilters[m.source])
+		m.refresh()
 	case "s":
-		m.sort = (m.sort + 1) % 3
+		m.sort = (m.sort + 1) % sortModes
 		m.status = "sorted by " + m.sort.String()
+		m.actions.SavePrefs(Prefs{Sort: m.sort.String()})
 		m.refresh()
 	case "l":
 		m.showLog = !m.showLog
@@ -164,6 +233,60 @@ func (m *Model) togglePause() string {
 	return "resumed " + row.Name
 }
 
+// toggleEnabled starts or stops forwarding the selected row.
+func (m *Model) toggleEnabled() string {
+	row, ok := m.selected()
+	if !ok {
+		return ""
+	}
+	if !m.actions.SetEnabled(row.Key, !row.Enabled) {
+		return row.Name + " cannot be forwarded"
+	}
+	if row.Enabled {
+		return "stopped " + row.Name
+	}
+	return "forwarding " + row.Name
+}
+
+// toggleAllVisible switches every row the user can currently see. Anything not
+// yet forwarded turns on; only once they are all on does the key turn them off,
+// so the common case — "give me all of these" — is a single press.
+func (m *Model) toggleAllVisible() string {
+	if len(m.rows) == 0 {
+		return ""
+	}
+	on := false
+	keys := make([]string, 0, len(m.rows))
+	for _, row := range m.rows {
+		keys = append(keys, row.Key)
+		if !row.Enabled {
+			on = true
+		}
+	}
+	changed := m.actions.SetEnabledAll(keys, on)
+	verb := "stopped"
+	if on {
+		verb = "forwarding"
+	}
+	return fmt.Sprintf("%s %d of %d shown", verb, changed, len(keys))
+}
+
+// openSelected opens the selected row in a browser. Only a row a probe has
+// identified as a web service has somewhere to open.
+func (m *Model) openSelected() string {
+	row, ok := m.selected()
+	if !ok {
+		return ""
+	}
+	if row.URL == "" {
+		return row.Name + " is not a web service"
+	}
+	if err := m.actions.OpenURL(row.URL); err != nil {
+		return "could not open " + row.URL + ": " + err.Error()
+	}
+	return "opening " + row.URL
+}
+
 // selected returns the highlighted row.
 func (m Model) selected() (state.Tunnel, bool) {
 	if m.cursor < 0 || m.cursor >= len(m.rows) {
@@ -180,9 +303,13 @@ func (m *Model) refresh() {
 		selectedKey = row.Key
 	}
 
+	source := sourceFilters[m.source]
 	rows := make([]state.Tunnel, 0, len(m.snap.Tunnels))
 	for _, t := range m.snap.Tunnels {
-		if matches(t, m.filter) {
+		if m.onlyOn && !t.Enabled {
+			continue
+		}
+		if fromSource(t, source) && matches(t, m.filter) {
 			rows = append(rows, t)
 		}
 	}
@@ -201,12 +328,40 @@ func (m *Model) refresh() {
 	}
 }
 
+// scopeName names what the "f" key is currently showing.
+func (m Model) scopeName() string {
+	if m.onlyOn {
+		return "forwarded only"
+	}
+	return "everything discovered"
+}
+
+// remoteKey is the text the REMOTE / URL column renders for a row.
+func remoteKey(t state.Tunnel) string {
+	if t.URL != "" {
+		return t.URL
+	}
+	return t.RemoteTarget
+}
+
+// fromSource applies the source filter. A row with no source at all is treated
+// as docker, matching how discovery reads its own zero value.
+func fromSource(t state.Tunnel, source string) bool {
+	if source == "" {
+		return true
+	}
+	if t.Source == "" {
+		return source == "docker"
+	}
+	return t.Source == source
+}
+
 func matches(t state.Tunnel, filter string) bool {
 	if filter == "" {
 		return true
 	}
 	needle := strings.ToLower(filter)
-	for _, hay := range []string{t.Name, t.Image, t.RemoteTarget, string(t.State)} {
+	for _, hay := range []string{t.Name, t.Image, t.RemoteTarget, string(t.State), t.Source} {
 		if strings.Contains(strings.ToLower(hay), needle) {
 			return true
 		}
@@ -226,6 +381,12 @@ func sortRows(rows []state.Tunnel, mode sortMode) {
 			at, bt := a.BytesIn+a.BytesOut, b.BytesIn+b.BytesOut
 			if at != bt {
 				return at > bt // busiest first
+			}
+		case sortByRemote:
+			// Sort on what the column actually shows, so the order matches what
+			// the eye reads. URLs sort together, after the bare host:port rows.
+			if ar, br := remoteKey(a), remoteKey(b); ar != br {
+				return ar < br
 			}
 		}
 		if a.Name != b.Name {

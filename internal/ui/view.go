@@ -26,6 +26,7 @@ var (
 		state.TunnelPaused:      lipgloss.NewStyle().Faint(true),
 		state.TunnelError:       lipgloss.NewStyle().Foreground(lipgloss.Color("197")),
 		state.TunnelUnsupported: lipgloss.NewStyle().Faint(true),
+		state.TunnelOffered:     lipgloss.NewStyle().Faint(true),
 	}
 
 	sshStateStyles = map[sshconn.State]lipgloss.Style{
@@ -70,7 +71,7 @@ func (m Model) header() string {
 		style = dimStyle
 	}
 
-	active, listening, degraded, broken := m.snap.Counts()
+	active, listening, degraded, broken, offered := m.snap.Counts()
 	parts := []string{
 		titleStyle.Render("auto-tunnel"),
 		m.snap.Target,
@@ -80,6 +81,15 @@ func (m Model) header() string {
 		fmt.Sprintf("%d container(s)", m.snap.Containers),
 		fmt.Sprintf("%d tunnel(s): %d active, %d idle, %d degraded, %d broken",
 			len(m.snap.Tunnels), active, listening, degraded, broken),
+	}
+	if offered > 0 {
+		parts = append(parts, fmt.Sprintf("%d available", offered))
+	}
+	if source := sourceFilters[m.source]; source != "" {
+		parts = append(parts, "showing "+source)
+	}
+	if m.onlyOn {
+		parts = append(parts, "forwarded only")
 	}
 	return strings.Join(parts, dimStyle.Render(" · "))
 }
@@ -101,25 +111,31 @@ func (m Model) table() string {
 		return dimStyle.Render("  no forwardable ports discovered yet")
 	}
 	if len(m.rows) == 0 {
-		return dimStyle.Render(fmt.Sprintf("  no tunnels match %q", m.filter))
+		return dimStyle.Render(fmt.Sprintf("  no tunnels match %q", m.describeFilter()))
 	}
 
 	const (
 		stateW = 12
+		srcW   = 6
 		nameW  = 22
 		localW = 12
-		remW   = 22
-		connW  = 7
-		byteW  = 10
+		// Wide enough for https://127.0.0.1:15432, the longest URL this can
+		// produce, so a web row never has its address cut short.
+		remW  = 24
+		connW = 7
+		byteW = 10
 	)
-	imageW := m.width - (stateW + nameW + localW + remW + connW + 2*byteW + 8)
-	imageW = clamp(imageW, 10, 34)
+	// DETAIL holds whatever describes the row beside its name: the image for a
+	// container, the bound address for a host socket, the spec for a declared
+	// forward.
+	detailW := m.width - (stateW + srcW + nameW + localW + remW + connW + 2*byteW + 9)
+	detailW = clamp(detailW, 10, 34)
 
 	var b strings.Builder
 	b.WriteString(headerStyle.Render(fmt.Sprintf(
-		"%-*s %-*s %-*s %-*s %-*s %*s %*s %*s",
-		stateW, "STATE", nameW, "CONTAINER", imageW, "IMAGE",
-		localW, "LOCAL", remW, "REMOTE", connW, "CONNS", byteW, "IN", byteW, "OUT")))
+		"%-*s %-*s %-*s %-*s %-*s %-*s %*s %*s %*s",
+		stateW, "STATE", srcW, "SRC", nameW, "NAME", detailW, "DETAIL",
+		localW, "LOCAL", remW, "REMOTE / URL", connW, "CONNS", byteW, "IN", byteW, "OUT")))
 	b.WriteString("\n")
 
 	visible := m.visibleRowCount()
@@ -135,17 +151,37 @@ func (m Model) table() string {
 		if t.LocalPort != 0 {
 			local = strconv.Itoa(t.LocalPort)
 		}
+		// An empty source is a docker row: discovery leaves the field at its
+		// zero value there, and a blank column would read as a bug.
+		source := t.Source
+		if source == "" {
+			source = "docker"
+		}
+		// A web service shows the address to open rather than the one it points
+		// at: the far side is in the log and on the selected-row line, while the
+		// URL is the thing the user is here to click.
+		remote := t.RemoteTarget
+		if t.URL != "" {
+			remote = t.URL
+		}
+		// The URL is printed as plain text rather than wrapped in an OSC 8
+		// hyperlink: terminals that honour that escape underline it, and a
+		// dotted rule through the table costs more than it buys. Terminals that
+		// detect bare URLs still make it clickable, and "o" opens it anywhere.
+		remoteCell := fmt.Sprintf("%-*s", remW, truncate(remote, remW))
 		line := fmt.Sprintf(
-			"%-*s %-*s %-*s %-*s %-*s %*d %*s %*s",
-			stateW, t.State, nameW, truncate(t.Name, nameW), imageW, truncate(t.Image, imageW),
-			localW, local, remW, truncate(t.RemoteTarget, remW),
+			"%-*s %-*s %-*s %-*s %-*s %s %*d %*s %*s",
+			stateW, t.State, srcW, truncate(source, srcW),
+			nameW, truncate(t.Name, nameW), detailW, truncate(t.Image, detailW),
+			localW, local, remoteCell,
 			connW, t.ActiveConns, byteW, humanBytes(t.BytesIn), byteW, humanBytes(t.BytesOut))
 
 		switch {
 		case i == m.cursor:
 			b.WriteString(selectedStyle.Render(line))
 		default:
-			// Colour only the state column so the row stays readable.
+			// Colour only the state column so the row stays readable. The link
+			// lives further along the line, so this slice never splits it.
 			style, ok := stateStyles[t.State]
 			if !ok {
 				style = dimStyle
@@ -158,11 +194,42 @@ func (m Model) table() string {
 	if end < len(m.rows) || start > 0 {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("  showing %d-%d of %d\n", start+1, end, len(m.rows))))
 	}
-	if row, ok := m.selected(); ok && row.LastError != "" {
-		b.WriteString(dimStyle.Render("  " + row.Name + ": " + truncate(row.LastError, max(20, m.width-6))))
-		b.WriteString("\n")
+	if row, ok := m.selected(); ok {
+		if row.LastError != "" {
+			b.WriteString(dimStyle.Render("  " + row.Name + ": " + truncate(row.LastError, max(20, m.width-6))))
+			b.WriteString("\n")
+		}
+		if row.URL != "" {
+			// The far side is only shown here, now that the column holds the URL.
+			b.WriteString(dimStyle.Render("  open: " + row.URL + "  (o)   via " + row.RemoteTarget))
+			b.WriteString("\n")
+		}
 	}
 	return b.String()
+}
+
+// onOff renders a toggle for the footer.
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
+}
+
+// describeFilter names whatever is narrowing the table, so an empty result can
+// explain itself whether the cause was the text filter, the source key, or both.
+func (m Model) describeFilter() string {
+	parts := []string{}
+	if m.onlyOn {
+		parts = append(parts, "forwarded")
+	}
+	if source := sourceFilters[m.source]; source != "" {
+		parts = append(parts, source)
+	}
+	if m.filter != "" {
+		parts = append(parts, m.filter)
+	}
+	return strings.Join(parts, " ")
 }
 
 func (m Model) logPane() string {
@@ -184,7 +251,9 @@ func (m Model) footer() string {
 	if m.editing {
 		return titleStyle.Render("filter: ") + m.filter + dimStyle.Render("   (enter to apply, esc to clear)")
 	}
-	help := dimStyle.Render("↑/↓ select · p pause · r rescan · s sort (" + m.sort.String() + ") · / filter · l log · q quit")
+	help := dimStyle.Render("↑/↓ select · enter on/off · o open · f forwarded (" + onOff(m.onlyOn) + ") · a all shown · t source (" +
+		sourceFilterName(sourceFilters[m.source]) + ") · p pause · r rescan · s sort (" +
+		m.sort.String() + ") · / filter · l log · q quit")
 	if m.filter != "" {
 		help = dimStyle.Render("filter "+strconv.Quote(m.filter)+" · ") + help
 	}

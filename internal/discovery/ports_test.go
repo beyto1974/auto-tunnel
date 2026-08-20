@@ -156,11 +156,31 @@ func TestPortMapTargetAndKey(t *testing.T) {
 	if got, want := published.Target(), "127.0.0.1:8080"; got != want {
 		t.Errorf("Target() = %q, want %q", got, want)
 	}
-	if got, want := published.Key(), "abc123:80/tcp"; got != want {
+	// The zero Source reads as docker, so a row built the old way still keys as
+	// a container port rather than landing in a nameless fourth source.
+	if got, want := published.Key(), "docker:abc123:80/tcp"; got != want {
 		t.Errorf("Key() = %q, want %q", got, want)
+	}
+	if got, want := published.PreferredLocal(), 8080; got != want {
+		t.Errorf("PreferredLocal() = %d, want the remote port %d", got, want)
 	}
 	if !published.Forwardable() {
 		t.Error("tcp port should be forwardable")
+	}
+
+	// A source and an owner of their own keep two rows apart even when they
+	// describe the same port number.
+	host := PortMap{Source: SourceHost, Owner: "host", ContainerPort: 80, Proto: ProtoTCP}
+	if got, want := host.Key(), "host:host:80/tcp"; got != want {
+		t.Errorf("Key() = %q, want %q", got, want)
+	}
+	if host.Key() == published.Key() {
+		t.Error("a host socket and a container port on 80 share a key")
+	}
+
+	pinned := PortMap{ContainerPort: 5432, HostPort: 5432, LocalPref: 15432, Proto: ProtoTCP}
+	if got, want := pinned.PreferredLocal(), 15432; got != want {
+		t.Errorf("PreferredLocal() = %d, want the declared local port %d", got, want)
 	}
 
 	exposed := PortMap{

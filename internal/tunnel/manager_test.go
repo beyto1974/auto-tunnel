@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -73,7 +74,7 @@ func testManager(t *testing.T, dial DialerFunc) (*Manager, context.Context) {
 	t.Cleanup(cancel)
 
 	base := freePort(t)
-	m := NewManager(dial, NewAllocator("127.0.0.1", base, 200), slog.New(slog.DiscardHandler))
+	m := NewManager(dial, NewAllocator("127.0.0.1", base, 200), slog.New(slog.DiscardHandler), false)
 	t.Cleanup(m.Close)
 	return m, ctx
 }
@@ -414,5 +415,201 @@ func TestManagerCloseReleasesPorts(t *testing.T) {
 	}
 	if len(m.Tunnels()) != 0 {
 		t.Errorf("Tunnels() = %d rows after Close, want 0", len(m.Tunnels()))
+	}
+}
+
+// offeredMap is a candidate the user has not asked for: listed, not forwarded.
+func offeredMap(name string, port int) discovery.PortMap {
+	pm := discovery.PortMap{
+		Source:        discovery.SourceHost,
+		Owner:         "host",
+		Name:          name,
+		Image:         "127.0.0.1",
+		ContainerPort: port,
+		HostIP:        "127.0.0.1",
+		HostPort:      port,
+		Proto:         discovery.ProtoTCP,
+		TargetHost:    "127.0.0.1",
+		Offered:       true,
+	}
+	return pm
+}
+
+func TestManagerListsOfferedPortsWithoutBindingThem(t *testing.T) {
+	echo := echoServer(t)
+	fake := &fakeSSH{to: echo.Addr().String()}
+	m, ctx := testManager(t, func() Dialer { return fake })
+
+	m.Reconcile(ctx, []discovery.PortMap{offeredMap("postgres", 5432)})
+
+	row, ok := rowFor(m.Tunnels(), "postgres")
+	if !ok {
+		t.Fatal("an offered port is missing from the dashboard entirely")
+	}
+	if row.State != state.TunnelOffered {
+		t.Errorf("state = %s, want AVAILABLE", row.State)
+	}
+	if row.Enabled {
+		t.Error("row reports itself as forwarded")
+	}
+	if row.LocalPort != 0 {
+		t.Errorf("LocalPort = %d, want none bound for a row nobody asked for", row.LocalPort)
+	}
+	if row.Source != string(discovery.SourceHost) {
+		t.Errorf("Source = %q, want host", row.Source)
+	}
+}
+
+func TestManagerEnableThenDisableKeepsTheSameLocalPort(t *testing.T) {
+	// Switching a row off has to release the port, and switching it back on has
+	// to reclaim the same number: a local port that moves under the user's feet
+	// breaks every bookmark and config file pointing at it.
+	echo := echoServer(t)
+	fake := &fakeSSH{to: echo.Addr().String()}
+	m, ctx := testManager(t, func() Dialer { return fake })
+
+	wanted := offeredMap("postgres", 5432)
+	wanted.Offered = false
+	m.Reconcile(ctx, []discovery.PortMap{wanted})
+
+	row, ok := rowFor(m.Tunnels(), "postgres")
+	if !ok || row.LocalPort == 0 {
+		t.Fatalf("row = %+v, want a bound tunnel", row)
+	}
+	if !row.Enabled {
+		t.Error("a forwarded row does not report itself as enabled")
+	}
+	port := row.LocalPort
+
+	m.Reconcile(ctx, []discovery.PortMap{offeredMap("postgres", 5432)})
+
+	row, _ = rowFor(m.Tunnels(), "postgres")
+	if row.State != state.TunnelOffered || row.LocalPort != 0 {
+		t.Errorf("row = %+v, want it back to AVAILABLE with no port", row)
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("local port %d is still bound after the row was switched off: %v", port, err)
+	}
+	ln.Close()
+
+	m.Reconcile(ctx, []discovery.PortMap{wanted})
+
+	row = waitForRow(t, m, "postgres", "come back", func(tn state.Tunnel) bool { return tn.LocalPort != 0 })
+	if row.LocalPort != port {
+		t.Errorf("local port moved from %d to %d across an off/on cycle", port, row.LocalPort)
+	}
+}
+
+func TestManagerDropsOfferedRowsThatDisappear(t *testing.T) {
+	m, ctx := testManager(t, func() Dialer { return nil })
+
+	m.Reconcile(ctx, []discovery.PortMap{offeredMap("postgres", 5432)})
+	if _, ok := rowFor(m.Tunnels(), "postgres"); !ok {
+		t.Fatal("offered row missing after the first reconcile")
+	}
+
+	m.Reconcile(ctx, nil)
+
+	if _, ok := rowFor(m.Tunnels(), "postgres"); ok {
+		t.Error("offered row survived the service it described going away")
+	}
+}
+
+func TestManagerHonoursADeclaredLocalPort(t *testing.T) {
+	echo := echoServer(t)
+	fake := &fakeSSH{to: echo.Addr().String()}
+	m, ctx := testManager(t, func() Dialer { return fake })
+
+	want := freePort(t)
+	pm := discovery.PortMap{
+		Source:        discovery.SourceStatic,
+		Owner:         "db",
+		Name:          "db",
+		ContainerPort: 5432,
+		HostPort:      5432,
+		LocalPref:     want,
+		Proto:         discovery.ProtoTCP,
+		TargetHost:    "127.0.0.1",
+	}
+	m.Reconcile(ctx, []discovery.PortMap{pm})
+
+	row, ok := rowFor(m.Tunnels(), "db")
+	if !ok {
+		t.Fatal("no row for the declared forward")
+	}
+	if row.LocalPort != want {
+		t.Errorf("LocalPort = %d, want the declared %d", row.LocalPort, want)
+	}
+	if got := roundTrip(t, row.LocalPort, "hello"); got != "hello" {
+		t.Errorf("echoed %q through the declared forward", got)
+	}
+}
+
+// countingDialer records how many dials are in flight at once.
+type countingDialer struct {
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+	calls    int
+}
+
+func (c *countingDialer) Dial(network, addr string) (net.Conn, error) {
+	c.mu.Lock()
+	c.inFlight++
+	c.calls++
+	if c.inFlight > c.peak {
+		c.peak = c.inFlight
+	}
+	c.mu.Unlock()
+
+	time.Sleep(20 * time.Millisecond) // hold the slot long enough to overlap
+	c.mu.Lock()
+	c.inFlight--
+	c.mu.Unlock()
+	return nil, errors.New("nothing is listening")
+}
+
+func (c *countingDialer) stats() (peak, calls int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peak, c.calls
+}
+
+func TestProbesAreBoundedSoAStartupDoesNotBurstTheConnection(t *testing.T) {
+	// -host-ports all can start a hundred tunnels in one second. Each probing
+	// immediately would open a hundred SSH channels at once for answers nobody
+	// can read that fast.
+	dialer := &countingDialer{}
+	base := freePort(t)
+	m := NewManager(func() Dialer { return dialer }, NewAllocator("127.0.0.1", base, 400),
+		slog.New(slog.DiscardHandler), true)
+	t.Cleanup(m.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	const tunnels = 30
+	maps := make([]discovery.PortMap, 0, tunnels)
+	for i := 0; i < tunnels; i++ {
+		maps = append(maps, portMap("svc"+strconv.Itoa(i), 8000+i, 9000+i, discovery.ProtoTCP))
+	}
+	m.Reconcile(ctx, maps)
+
+	// Wait for the probes to work through the queue.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, calls := dialer.stats(); calls >= tunnels {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	peak, calls := dialer.stats()
+	if calls == 0 {
+		t.Fatal("no port was ever probed")
+	}
+	if peak > maxConcurrentProbes {
+		t.Errorf("%d probes ran at once, want at most %d", peak, maxConcurrentProbes)
 	}
 }

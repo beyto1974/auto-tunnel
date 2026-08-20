@@ -63,8 +63,25 @@ type config struct {
 	include            *regexp.Regexp
 	exclude            *regexp.Regexp
 	includeUnpublished bool
+	noDocker           bool
+	probeHTTP          bool
+	hostMode           discovery.HostMode
+	listenCommand      string
+	hostExclude        *regexp.Regexp
+	static             []discovery.PortMap
+	selectionPath      string
 	noTUI              bool
 	verbose            bool
+}
+
+// forwardList collects a repeatable -forward flag.
+type forwardList []string
+
+func (f *forwardList) String() string { return strings.Join(*f, ",") }
+
+func (f *forwardList) Set(v string) error {
+	*f = append(*f, v)
+	return nil
 }
 
 func main() {
@@ -97,6 +114,13 @@ func run() error {
 		logger.Warn("binding forwarded ports off loopback: every discovered remote service "+
 			"becomes reachable from this network with no authentication", "bind", cfg.bind)
 		fmt.Fprintf(os.Stderr, "auto-tunnel: warning: -bind %s exposes every forwarded port to the network\n", cfg.bind)
+	}
+	if cfg.hostMode == discovery.HostPortsAll {
+		// Unlike a container port, a host socket was never published for anyone:
+		// this forwards databases, agents, and admin interfaces the operator
+		// deliberately left on loopback.
+		logger.Warn("forwarding every port the remote host listens on, not only its containers")
+		fmt.Fprintf(os.Stderr, "auto-tunnel: warning: -host-ports all forwards every listening service on the remote host\n")
 	}
 
 	target, err := sshconn.ResolveTarget(cfg.target)
@@ -220,11 +244,15 @@ func render(cfg *config, snap state.Snapshot) string {
 			note = fmt.Sprintf("  (%s is not forwardable over ssh)", strings.ToUpper(t.Proto))
 		case t.State == state.TunnelError:
 			note = "  (" + t.LastError + ")"
+		case t.State == state.TunnelOffered:
+			note = "  (available, not forwarded)"
+		case t.URL != "":
+			note = "  (" + t.URL + ")"
 		case !t.Published:
 			note = "  (unpublished, via container IP)"
 		}
-		fmt.Fprintf(&b, "  %-11s %-24s %-22s -> %s%s\n",
-			t.State, truncate(t.Name, 24), local, t.RemoteTarget, note)
+		fmt.Fprintf(&b, "  %-11s %-7s %-24s %-22s -> %s%s\n",
+			t.State, t.Source, truncate(t.Name, 24), local, t.RemoteTarget, note)
 	}
 	return b.String()
 }
@@ -255,7 +283,8 @@ func truncate(s string, n int) string {
 
 func parseFlags(args []string) (*config, error) {
 	cfg := &config{}
-	var includePattern, excludePattern string
+	var includePattern, excludePattern, hostExcludePattern, hostMode string
+	var forwards forwardList
 	var showVersion bool
 
 	fs := flag.NewFlagSet("auto-tunnel", flag.ContinueOnError)
@@ -269,6 +298,16 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&includePattern, "include", "", "only forward containers whose name matches this regexp")
 	fs.StringVar(&excludePattern, "exclude", "", "never forward containers whose name matches this regexp")
 	fs.BoolVar(&cfg.includeUnpublished, "include-unpublished", false, "also forward EXPOSEd-but-unpublished ports via the container IP")
+	fs.BoolVar(&cfg.probeHTTP, "probe-http", true,
+		"ask each forwarded port whether it speaks HTTP, so the dashboard can offer a clickable URL")
+	fs.BoolVar(&cfg.noDocker, "no-docker", false, "skip docker discovery entirely, for a host that runs none")
+	fs.StringVar(&hostMode, "host-ports", string(discovery.HostPortsSelect),
+		"what to do with the remote host's own listening ports: off, select (list them, forward on request), or all")
+	fs.StringVar(&cfg.listenCommand, "host-cmd", discovery.DefaultListenCommand, "remote command listing listening sockets")
+	fs.StringVar(&hostExcludePattern, "host-exclude", "", "never forward host ports whose process name or port matches this regexp")
+	fs.Var(&forwards, "forward", "declare a forward that discovery cannot take away, e.g. 5432, 15432:5432, 8000-8010, db=5432@10.0.0.5 (repeatable)")
+	fs.StringVar(&cfg.selectionPath, "selection", "",
+		"file remembering which discovered ports are forwarded, between runs (default: one per target under the user config directory; \"off\" to remember nothing)")
 	fs.BoolVar(&cfg.noTUI, "no-tui", false, "print plain text instead of the live dashboard")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "log at debug level")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
@@ -319,6 +358,27 @@ func parseFlags(args []string) (*config, error) {
 			return nil, fmt.Errorf("bad -exclude regexp: %w", err)
 		}
 		cfg.exclude = re
+	}
+	if hostExcludePattern != "" {
+		re, err := regexp.Compile(hostExcludePattern)
+		if err != nil {
+			return nil, fmt.Errorf("bad -host-exclude regexp: %w", err)
+		}
+		cfg.hostExclude = re
+	}
+	mode, err := discovery.ParseHostMode(hostMode)
+	if err != nil {
+		return nil, err
+	}
+	cfg.hostMode = mode
+	// Bad -forward specs are a startup error rather than a missing row: a typo
+	// in one of several forwards is otherwise invisible on the dashboard.
+	cfg.static, err = discovery.ParseForwards(forwards)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.noDocker && !cfg.hostMode.Enabled() && len(cfg.static) == 0 {
+		return nil, fmt.Errorf("-no-docker with -host-ports off leaves nothing to forward: drop one of them, or add -forward")
 	}
 	return cfg, nil
 }
