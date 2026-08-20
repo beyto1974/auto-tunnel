@@ -21,6 +21,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Build
         run: go build ./...
 
